@@ -322,7 +322,12 @@ test("an unverified old PID is never killed and its verified CDP port is reused"
   };
   const h = harness({
     initialSession: existing,
-    dependencies: { validateRecordedDaemon: async (session) => session.nonce === "old" ? { valid: false, reason: "command-line" } : { valid: true } }
+    dependencies: {
+      isProcessRunning: () => false,
+      validateRecordedDaemon: async (session) => session.nonce === "old"
+        ? { valid: false, reason: "command-line" }
+        : { valid: true }
+    }
   });
   await startCommand({}, h.dependencies);
 
