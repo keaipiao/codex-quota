@@ -1,6 +1,6 @@
 # Release guide
 
-This checklist prepares the first public `0.2.0` release and subsequent
+This checklist prepares the current `0.2.1` release and subsequent
 releases. Run release commands from PowerShell on a clean Windows checkout.
 
 ## One-time repository setup
@@ -42,7 +42,7 @@ it. If `quotapeek` has never been published:
 4. Publish that exact downloaded archive rather than repacking the checkout:
 
    ```powershell
-   npm.cmd publish .\quotapeek-0.2.0.tgz --access public --provenance=false
+   npm.cmd publish .\quotapeek-0.2.1.tgz --access public --provenance=false
    ```
 
    The one-time `--provenance=false` overrides the package default because a
@@ -58,11 +58,11 @@ can change independently of this project.
 
 ## Prepare a release
 
-1. Choose the version. For the first public release, it is `0.2.0`.
+1. Choose the next version. The current release is `0.2.1`.
 2. Update the version in `package.json` without creating a tag yet:
 
    ```powershell
-   npm.cmd version 0.2.0 --no-git-tag-version --allow-same-version
+   npm.cmd version 0.2.1 --no-git-tag-version --allow-same-version
    ```
 
 3. Change the matching `CHANGELOG.md` heading from `Unreleased` to the release
@@ -109,13 +109,13 @@ After the release commit is merged on the default branch:
 ```powershell
 git switch <default-branch>
 git pull --ff-only
-git tag -a v0.2.0 -m "QuotaPeek 0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "QuotaPeek 0.2.1"
+git push origin v0.2.1
 ```
 
 The tag workflow:
 
-1. verifies that `v0.2.0` exactly matches `package.json` version `0.2.0`;
+1. verifies that `v0.2.1` exactly matches `package.json` version `0.2.1`;
 2. runs syntax checks and the complete test suite on Node.js 24;
 3. creates the npm `.tgz` and a `.sha256` checksum;
 4. publishes to npm through OIDC only when `PUBLISH_NPM=true`;
@@ -131,11 +131,11 @@ tag. If a release contains a defect, publish a new patch.
 - [ ] On a clean Windows 11 x64 user profile with Node.js 22+, run:
 
   ```powershell
-  npx.cmd --yes quotapeek@0.2.0 install
-  npx.cmd --yes quotapeek@0.2.0 doctor
+  npx.cmd --yes quotapeek@0.2.1 install
+  npx.cmd --yes quotapeek@0.2.1 doctor
   ```
 
-- [ ] Fully exit the Store app, launch **Codex + Quota**, and confirm English and
+- [ ] Fully exit the Store app, launch **QuotaPeek for Codex**, and confirm English and
       Chinese renderer locales, quota refresh, account-menu clearance, and
       conversation scrolling.
 - [ ] Run `doctor --live`, inspect its output for accidental identifiers, and

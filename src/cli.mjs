@@ -3,7 +3,7 @@ import { CodexQuotaError } from "./errors.mjs";
 import { PACKAGE_ROOT } from "./paths.mjs";
 import { readPackageMetadata } from "./commands/install.mjs";
 
-const HELP = `QuotaPeek for Codex (experimental Windows MVP)
+const HELP = `QuotaPeek for Codex
 
 Usage:
   quotapeek install [--no-desktop] [--no-shortcuts] [--json]
@@ -12,7 +12,7 @@ Usage:
   quotapeek uninstall [--json]
   quotapeek version
 
-The first cold start must go through "Codex + Quota" (or the start command)
+The first cold start must go through "QuotaPeek for Codex" (or the start command)
 so the official Store process receives loopback CDP flags.
 `;
 
@@ -167,7 +167,7 @@ export function emitInstallHuman(result, io) {
   if (result.shortcuts?.skipped) {
     io.stdout("Installation does not start Codex. Shortcuts were not created (--no-shortcuts); start it with 'quotapeek start'.\n");
   } else {
-    io.stdout("Installation does not start Codex. Next, open the 'Codex + Quota' shortcut directly; you do not need to run 'quotapeek start'. CDP remains a same-user security boundary.\n");
+    io.stdout("Installation does not start Codex. Next, open the 'QuotaPeek for Codex' shortcut directly; you do not need to run 'quotapeek start'. CDP remains a same-user security boundary.\n");
   }
 }
 

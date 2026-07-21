@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-07-21
+
+### Added
+
+- An original QuotaPeek shortcut icon built around a quota-gauge `Q` and a
+  small peek indicator, with embedded Windows sizes from 16 to 256 pixels.
+
+### Changed
+
+- New desktop and Start menu shortcuts are named **QuotaPeek for Codex**.
+- Reinstalling safely migrates owned **Codex + Quota** shortcuts to the new
+  name, while preserving same-name shortcuts that belong to the user or a
+  different installation.
+- Installation guidance now makes clear that `install` does not launch Codex
+  and that the shortcut is used directly after installation.
+
 ## [0.2.0] - 2026-07-21
 
 ### Added

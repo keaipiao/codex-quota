@@ -12,8 +12,10 @@ $ProgressPreference = "SilentlyContinue"
 $WarningPreference = "SilentlyContinue"
 $InformationPreference = "SilentlyContinue"
 
-$ManagedDescription = "Managed by codex-sidebar-quota: start Codex with the local quota panel"
+$ManagedDescription = "Managed by QuotaPeek for Codex: start Codex with the local quota panel"
+$PreviousManagedDescription = "Managed by codex-sidebar-quota: start Codex with the local quota panel"
 $LegacyDescription = "Start the official Codex client with the local quota panel"
+$ShortcutNames = @("QuotaPeek for Codex.lnk", "Codex + Quota.lnk")
 $backupRoot = $null
 
 function Write-Result([object]$Value) {
@@ -57,7 +59,7 @@ function Test-NewManagedShortcut([object]$Shortcut, [string]$ManagedEngines, [st
         $working = Normalize-Path ([string]$Shortcut.WorkingDirectory)
         if (-not (Is-UnderPath $working $ManagedEngines)) { return $false }
         if (-not (Same-Path ([string]$Shortcut.TargetPath) $PowerShellPath)) { return $false }
-        if ([string]$Shortcut.Description -ne $ManagedDescription) { return $false }
+        if ([string]$Shortcut.Description -notin @($ManagedDescription, $PreviousManagedDescription)) { return $false }
         $helper = Normalize-Path (Join-Path $working "windows\hidden-launch.ps1")
         $prefix = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File " +
             (Quote-ShortcutArgument $helper) + " -EngineRoot " + (Quote-ShortcutArgument $working) + " -NodePath `""
@@ -94,10 +96,13 @@ try {
     # Bind shortcut ownership to this product root. An uninstall running from
     # another LOCALAPPDATA must never remove a different installation's links.
     $managedEngines = Normalize-Path (Split-Path -Parent $resolvedEngine)
-    $destinations = @(
-        (Join-Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::StartMenu)) "Programs") "Codex + Quota.lnk"),
-        (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)) "Codex + Quota.lnk")
-    )
+    $programs = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::StartMenu)) "Programs"
+    $desktopPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+    $destinations = @()
+    foreach ($shortcutName in $ShortcutNames) {
+        $destinations += Join-Path $programs $shortcutName
+        $destinations += Join-Path $desktopPath $shortcutName
+    }
 
     $shell = New-Object -ComObject WScript.Shell
     $owned = @()
@@ -137,7 +142,12 @@ try {
         throw
     }
 
-    if ($null -ne $backupRoot) { Remove-Item -LiteralPath $backupRoot -Recurse -Force; $backupRoot = $null }
+    if ($null -ne $backupRoot) {
+        # Removal is already committed; cleanup of its temporary rollback copy
+        # is best-effort so a file-indexer race cannot report a false failure.
+        try { Remove-Item -LiteralPath $backupRoot -Recurse -Force -ErrorAction Stop } catch {}
+        $backupRoot = $null
+    }
     Write-Result ([pscustomobject]@{ ok = $true; removed = $removed; skipped = $skipped })
     exit 0
 } catch {

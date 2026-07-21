@@ -14,8 +14,11 @@ $ProgressPreference = "SilentlyContinue"
 $WarningPreference = "SilentlyContinue"
 $InformationPreference = "SilentlyContinue"
 
-$ManagedDescription = "Managed by codex-sidebar-quota: start Codex with the local quota panel"
+$ManagedDescription = "Managed by QuotaPeek for Codex: start Codex with the local quota panel"
+$PreviousManagedDescription = "Managed by codex-sidebar-quota: start Codex with the local quota panel"
 $LegacyDescription = "Start the official Codex client with the local quota panel"
+$CurrentShortcutName = "QuotaPeek for Codex.lnk"
+$LegacyShortcutName = "Codex + Quota.lnk"
 $backupRoot = $null
 
 function Write-Result([object]$Value) {
@@ -66,7 +69,7 @@ function Test-NewManagedShortcut([object]$Shortcut, [string]$ManagedEngines, [st
         $working = Normalize-Path ([string]$Shortcut.WorkingDirectory)
         if (-not (Is-UnderPath $working $ManagedEngines)) { return $false }
         if (-not (Same-Path ([string]$Shortcut.TargetPath) $PowerShellPath)) { return $false }
-        if ([string]$Shortcut.Description -ne $ManagedDescription) { return $false }
+        if ([string]$Shortcut.Description -notin @($ManagedDescription, $PreviousManagedDescription)) { return $false }
 
         $helper = Normalize-Path (Join-Path $working "windows\hidden-launch.ps1")
         $prefix = "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy RemoteSigned -File " +
@@ -106,11 +109,15 @@ try {
     $resolvedNode = Normalize-Path ((Resolve-Path -LiteralPath $NodePath -ErrorAction Stop).Path)
     $entryPoint = Normalize-Path (Join-Path $resolvedEngine "bin\codex-quota.mjs")
     $launchHelper = Normalize-Path (Join-Path $resolvedEngine "windows\hidden-launch.ps1")
+    $iconPath = Normalize-Path (Join-Path $resolvedEngine "windows\assets\quotapeek.ico")
     if (-not (Test-Path -LiteralPath $entryPoint -PathType Leaf)) {
         Throw-ShortcutError "E_ENTRY_POINT" "The installed quota-panel entry point was not found." @{ path = $entryPoint }
     }
     if (-not (Test-Path -LiteralPath $launchHelper -PathType Leaf)) {
         Throw-ShortcutError "E_LAUNCH_HELPER" "The hidden-launch helper was not found." @{ path = $launchHelper }
+    }
+    if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+        Throw-ShortcutError "E_SHORTCUT_ICON" "The QuotaPeek shortcut icon was not found." @{ path = $iconPath }
     }
     if ([System.IO.Path]::GetFileName($resolvedNode) -ine "node.exe") {
         Throw-ShortcutError "E_NODE_PATH" "NodePath must resolve to node.exe."
@@ -126,10 +133,18 @@ try {
     # explicit LOCALAPPDATA overrides may legitimately point elsewhere.
     $managedEngines = Normalize-Path (Split-Path -Parent $resolvedEngine)
     $programs = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::StartMenu)) "Programs"
-    $destinations = @((Join-Path $programs "Codex + Quota.lnk"))
+    $desktopPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+    $destinations = @((Join-Path $programs $CurrentShortcutName))
     if ($Desktop) {
-        $destinations += Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)) "Codex + Quota.lnk"
+        $destinations += Join-Path $desktopPath $CurrentShortcutName
     }
+    # Always inspect both legacy locations during an upgrade. This removes only
+    # links whose target, arguments, working directory, and ownership marker all
+    # bind them to this managed product root. A same-name user link is preserved.
+    $legacyDestinations = @(
+        (Join-Path $programs $LegacyShortcutName),
+        (Join-Path $desktopPath $LegacyShortcutName)
+    )
 
     $shell = New-Object -ComObject WScript.Shell
     $plans = @()
@@ -152,18 +167,31 @@ try {
         $plans += [pscustomobject]@{ destination = $destination; existed = $existed; backup = $null }
     }
 
-    if (($plans | Where-Object { $_.existed }).Count -gt 0) {
+    $legacyPlans = @()
+    $preservedLegacy = @()
+    foreach ($destination in $legacyDestinations) {
+        if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) { continue }
+        $existing = $shell.CreateShortcut($destination)
+        if (Test-ManagedShortcut $existing $managedEngines $powerShellPath) {
+            $legacyPlans += [pscustomobject]@{ destination = $destination; existed = $true; backup = $null }
+        } else {
+            $preservedLegacy += [pscustomobject]@{ path = $destination; reason = "ownership-mismatch" }
+        }
+    }
+
+    $mutablePlans = @($plans | Where-Object { $_.existed }) + @($legacyPlans)
+    if ($mutablePlans.Count -gt 0) {
         $backupRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-sidebar-quota-create-" + [Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $backupRoot | Out-Null
-        for ($index = 0; $index -lt $plans.Count; $index++) {
-            if (-not $plans[$index].existed) { continue }
+        for ($index = 0; $index -lt $mutablePlans.Count; $index++) {
             $backup = Join-Path $backupRoot ($index.ToString() + ".lnk")
-            Copy-Item -LiteralPath $plans[$index].destination -Destination $backup -Force
-            $plans[$index].backup = $backup
+            Copy-Item -LiteralPath $mutablePlans[$index].destination -Destination $backup -Force
+            $mutablePlans[$index].backup = $backup
         }
     }
 
     $created = @()
+    $removedLegacy = @()
     try {
         foreach ($plan in $plans) {
             $shortcut = $shell.CreateShortcut($plan.destination)
@@ -171,9 +199,14 @@ try {
             $shortcut.Arguments = $arguments
             $shortcut.WorkingDirectory = $resolvedEngine
             $shortcut.Description = $ManagedDescription
+            $shortcut.IconLocation = $iconPath
             $shortcut.WindowStyle = 7
             $shortcut.Save()
             $created += $plan.destination
+        }
+        foreach ($plan in $legacyPlans) {
+            Remove-Item -LiteralPath $plan.destination -Force
+            $removedLegacy += $plan.destination
         }
     } catch {
         foreach ($plan in $plans) {
@@ -183,17 +216,30 @@ try {
                 Remove-Item -LiteralPath $plan.destination -Force -ErrorAction SilentlyContinue
             }
         }
+        foreach ($plan in $legacyPlans) {
+            if ($null -ne $plan.backup -and (Test-Path -LiteralPath $plan.backup -PathType Leaf)) {
+                Copy-Item -LiteralPath $plan.backup -Destination $plan.destination -Force
+            }
+        }
         throw
     }
 
-    if ($null -ne $backupRoot) { Remove-Item -LiteralPath $backupRoot -Recurse -Force; $backupRoot = $null }
+    if ($null -ne $backupRoot) {
+        # The shortcut transaction is already committed. A scanner briefly
+        # holding a temp backup must not turn success into a broken rollback.
+        try { Remove-Item -LiteralPath $backupRoot -Recurse -Force -ErrorAction Stop } catch {}
+        $backupRoot = $null
+    }
 
     Write-Result ([pscustomobject]@{
         ok = $true
         created = $created
+        removedLegacy = $removedLegacy
+        preservedLegacy = $preservedLegacy
         targetPath = $powerShellPath
         arguments = $arguments
         workingDirectory = $resolvedEngine
+        iconLocation = $iconPath
         hidden = $true
     })
     exit 0

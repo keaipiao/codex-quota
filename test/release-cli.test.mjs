@@ -75,8 +75,8 @@ test("the conventional global --version form returns the package version", async
   const { capture, io } = captureIo();
   const result = await main(["--version"], io);
   assert.equal(result.ok, true);
-  assert.equal(result.version, "0.2.0");
-  assert.equal(capture.stdout, "0.2.0\n");
+  assert.equal(result.version, "0.2.1");
+  assert.equal(capture.stdout, "0.2.1\n");
 });
 
 test("--json produces one structured error result and marks failure", async () => {
@@ -136,11 +136,11 @@ test("default install output says to open the shortcut without a second command"
   const { capture, io } = captureIo();
   emitInstallHuman({
     ok: true,
-    install: { version: "0.2.0", engineRoot: "C:\\runtime" },
+    install: { version: "0.2.1", engineRoot: "C:\\runtime" },
     shortcuts: { created: [] }
   }, io);
   assert.match(capture.stdout, /Installation does not start Codex/);
-  assert.match(capture.stdout, /open the 'Codex \+ Quota' shortcut directly/);
+  assert.match(capture.stdout, /open the 'QuotaPeek for Codex' shortcut directly/);
   assert.match(capture.stdout, /do not need to run 'quotapeek start'/);
 });
 
@@ -161,13 +161,28 @@ test("shortcut scripts use the hidden static launcher and transactional owned re
   const hidden = await readFile(join(PACKAGE_ROOT, "windows", "hidden-launch.ps1"), "utf8");
   assert.match(create, /-WindowStyle Hidden/);
   assert.match(create, /hidden-launch\.ps1/);
-  assert.match(create, /Managed by codex-sidebar-quota/);
+  assert.match(create, /Managed by QuotaPeek for Codex/);
+  assert.match(create, /\$PreviousManagedDescription = "Managed by codex-sidebar-quota/);
+  assert.match(create, /\$CurrentShortcutName = "QuotaPeek for Codex\.lnk"/);
+  assert.match(create, /\$LegacyShortcutName = "Codex \+ Quota\.lnk"/);
+  assert.match(create, /\$legacyDestinations/);
+  assert.match(create, /removedLegacy/);
+  assert.match(create, /preservedLegacy/);
+  assert.match(create, /windows\\assets\\quotapeek\.ico/);
+  assert.match(create, /E_SHORTCUT_ICON/);
+  assert.match(create, /\$shortcut\.IconLocation = \$iconPath/);
+  assert.match(create, /iconLocation = \$iconPath/);
   assert.match(create, /codex-sidebar-quota-create-/);
-  assert.match(create, /Copy-Item[\s\S]+\.Save\(\)[\s\S]+Copy-Item/);
+  assert.match(create, /Copy-Item[\s\S]+\.Save\(\)[\s\S]+Remove-Item[\s\S]+Copy-Item/);
   assert.match(remove, /ownership-mismatch/);
+  assert.match(remove, /\$ShortcutNames = @\("QuotaPeek for Codex\.lnk", "Codex \+ Quota\.lnk"\)/);
   for (const script of [create, remove]) {
+    assert.match(script, /\$Shortcut\.Description -notin @\(\$ManagedDescription, \$PreviousManagedDescription\)/);
     assert.match(script, /\$managedEngines = Normalize-Path \(Split-Path -Parent \$resolvedEngine\)/);
+    assert.match(script, /\$desktopPath = \[Environment\]::GetFolderPath/);
+    assert.doesNotMatch(script, /\$desktop\s*=/i);
     assert.doesNotMatch(script, /SpecialFolder\]::LocalApplicationData/);
+    assert.match(script, /try \{ Remove-Item -LiteralPath \$backupRoot -Recurse -Force -ErrorAction Stop \} catch \{\}/);
   }
   assert.match(remove, /Copy-Item[\s\S]+Remove-Item[\s\S]+Copy-Item/);
   for (const script of [create, remove]) {
@@ -181,4 +196,30 @@ test("shortcut scripts use the hidden static launcher and transactional owned re
   assert.match(hidden, /launcher-error\.log/);
   assert.match(hidden, /%LOCALAPPDATA%/);
   assert.match(hidden, /%USERPROFILE%/);
+});
+
+test("the Windows shortcut icon contains the required embedded sizes", async () => {
+  const icon = await readFile(join(PACKAGE_ROOT, "windows", "assets", "quotapeek.ico"));
+  assert.equal(icon.readUInt16LE(0), 0);
+  assert.equal(icon.readUInt16LE(2), 1);
+  const count = icon.readUInt16LE(4);
+  assert.ok(count > 0);
+
+  const sizes = new Set();
+  for (let index = 0; index < count; index += 1) {
+    const entry = 6 + index * 16;
+    const width = icon[entry] || 256;
+    const height = icon[entry + 1] || 256;
+    const byteLength = icon.readUInt32LE(entry + 8);
+    const offset = icon.readUInt32LE(entry + 12);
+    assert.equal(width, height);
+    assert.ok(byteLength > 0);
+    assert.ok(offset >= 6 + count * 16);
+    assert.ok(offset + byteLength <= icon.length);
+    sizes.add(width);
+  }
+
+  for (const required of [16, 24, 32, 48, 256]) {
+    assert.ok(sizes.has(required), `missing ${required}x${required} icon layer`);
+  }
 });
