@@ -163,10 +163,11 @@ jobs:
           $archive = $archives[0].FullName
           $checksum = "$archive.sha256"
           $tag = [string]$env:GITHUB_REF_NAME
-          & gh release view $tag *> $null
+          $repository = [string]$env:GITHUB_REPOSITORY
+          & gh release view $tag --repo $repository *> $null
           if ($LASTEXITCODE -eq 0) {
-            & gh release upload $tag $archive $checksum --clobber
+            & gh release upload $tag $archive $checksum --clobber --repo $repository
           } else {
-            & gh release create $tag $archive $checksum --verify-tag --generate-notes --title "QuotaPeek for Codex $env:RELEASE_VERSION"
+            & gh release create $tag $archive $checksum --repo $repository --verify-tag --generate-notes --title "QuotaPeek for Codex $env:RELEASE_VERSION"
           }
           if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed" }
