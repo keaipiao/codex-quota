@@ -32,7 +32,7 @@ control.
 For a local manual installation from the checkout:
 
 ```powershell
-node .\bin\codex-q.mjs install
+node .\bin\codex-quota.mjs install
 ```
 
 Fully exit the desktop app before testing a new cold start. Do not automate

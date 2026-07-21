@@ -6,13 +6,13 @@ import { readPackageMetadata } from "./commands/install.mjs";
 const HELP = `Codex Quota
 
 Usage:
-  codex-q install [--no-desktop] [--no-shortcuts] [--json]
-  codex-q start [--port PORT] [--foreground] [--json]
-  codex-q doctor [--live] [--json]
-  codex-q uninstall [--json]
-  codex-q version
+  codex-quota install [--no-desktop] [--no-shortcuts] [--json]
+  codex-quota start [--port PORT] [--foreground] [--json]
+  codex-quota doctor [--live] [--json]
+  codex-quota uninstall [--json]
+  codex-quota version
 
-The first cold start must go through "Codex + Quota" (or the start command)
+Every cold start must go through "Codex + Quota" (or the start command)
 so the official Store process receives loopback CDP flags.
 `;
 
@@ -165,9 +165,9 @@ export function emitInstallHuman(result, io) {
   if (!result.ok) return emitHumanFailure(result, io);
   io.stdout(`Installed Codex Quota ${result.install.version} in ${result.install.engineRoot}\n`);
   if (result.shortcuts?.skipped) {
-    io.stdout("Installation does not start Codex. Shortcuts were not created (--no-shortcuts); start it with 'codex-q start'.\n");
+    io.stdout("Installation does not start Codex. Shortcuts were not created (--no-shortcuts); start it with 'npx.cmd --yes @elonmark/codex-quota@latest start'.\n");
   } else {
-    io.stdout("Installation does not start Codex. Next, open the 'Codex + Quota' shortcut directly; you do not need to run 'codex-q start'. CDP remains a same-user security boundary.\n");
+    io.stdout("Installation does not start Codex. Next, open the 'Codex + Quota' shortcut directly. CDP remains a same-user security boundary.\n");
   }
 }
 

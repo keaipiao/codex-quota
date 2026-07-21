@@ -15,8 +15,9 @@ Requirements: Windows 11 x64, the Microsoft Store Codex/ChatGPT app
 
 1. Install [Node.js 22 or newer](https://nodejs.org/) if needed.
 2. Fully exit every Codex/ChatGPT desktop process.
-3. Open **PowerShell** in any directory. You do not need to clone this repository
-   or run `cd`.
+3. Open **PowerShell** in its default directory, or any directory outside a
+   Codex Quota source checkout. You do not need to clone this repository or run
+   `cd`.
 4. Run:
 
    ```powershell
@@ -49,8 +50,9 @@ native footer quota.
 ## Update
 
 Routine Codex desktop updates require no Codex Quota reinstall. To update
-Codex Quota itself, run this from any PowerShell directory, fully exit Codex,
-and then reopen **Codex + Quota**:
+Codex Quota itself, run this from the default PowerShell directory (or any
+directory outside its source checkout), fully exit Codex, and then reopen
+**Codex + Quota**:
 
 ```powershell
 npx.cmd --yes @elonmark/codex-quota@latest install
@@ -66,7 +68,8 @@ If the panel does not appear:
 
 1. Fully exit Codex/ChatGPT; check Task Manager if needed.
 2. Cold-start it through **Codex + Quota**, not the official shortcut.
-3. Run from any PowerShell directory:
+3. Run from the default PowerShell directory or any directory outside a Codex
+   Quota source checkout:
 
    ```powershell
    npx.cmd --yes @elonmark/codex-quota@latest doctor --live
@@ -76,7 +79,8 @@ If the hidden launch does nothing, inspect
 `%LOCALAPPDATA%\CodexQuota\logs\launcher-error.log`. Never publish `auth.json`,
 the contents of `%LOCALAPPDATA%\CodexQuota`, or unreviewed raw logs.
 
-As a terminal-only alternative to the shortcut, run:
+As a terminal-only alternative to the shortcut, run from the default
+PowerShell directory or any directory outside a Codex Quota source checkout:
 
 ```powershell
 npx.cmd --yes @elonmark/codex-quota@latest start
@@ -84,8 +88,9 @@ npx.cmd --yes @elonmark/codex-quota@latest start
 
 ## Uninstall
 
-Run from any PowerShell directory, then fully exit Codex and reopen it through
-the official shortcut:
+Run from the default PowerShell directory or any directory outside a Codex
+Quota source checkout, then fully exit Codex and reopen it through the official
+shortcut:
 
 ```powershell
 npx.cmd --yes @elonmark/codex-quota@latest uninstall

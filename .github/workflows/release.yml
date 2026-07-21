@@ -6,7 +6,7 @@ on:
       - "v*"
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -22,39 +22,56 @@ jobs:
     steps:
       - name: Check out tagged source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
 
-      - name: Set up Node.js 24
+      - name: Set up pinned release toolchain
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 24
+          node-version: "24.18.0"
           package-manager-cache: false
 
-      - name: Match tag to package version
-        id: version
+      - name: Verify pinned npm version
         shell: pwsh
         run: |
-          $metadata = Get-Content package.json -Raw | ConvertFrom-Json
-          $version = [string]$metadata.version
-          $tag = [string]$env:GITHUB_REF_NAME
-          if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$') {
-            throw "package.json contains an unsupported version: $version"
+          $npmVersion = (npm.cmd --version).Trim()
+          if ($npmVersion -ne '11.16.0') { throw "Expected npm 11.16.0; found $npmVersion" }
+
+      - name: Verify tag commit is on the default branch
+        shell: pwsh
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DEFAULT_BRANCH)) {
+            throw "Repository default branch is unavailable"
           }
-          if ($tag -ne "v$version") {
-            throw "Tag $tag does not match package.json version $version"
+          $remoteRef = "refs/remotes/origin/$env:DEFAULT_BRANCH"
+          & git fetch --no-tags origin "+refs/heads/$env:DEFAULT_BRANCH`:$remoteRef"
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch the default branch" }
+          & git merge-base --is-ancestor $env:GITHUB_SHA $remoteRef
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tagged commit $env:GITHUB_SHA is not contained in $env:DEFAULT_BRANCH"
+          }
+
+      - name: Match tag and validate public package contract
+        id: version
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = (& node scripts/verify-release.mjs | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($version)) {
+            throw "Release contract validation failed"
           }
           "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Verify lockfile policy
         shell: pwsh
         run: |
-          if (Test-Path package-lock.json) {
-            npm.cmd ci --ignore-scripts --no-audit --no-fund
-            if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
-          } elseif ((Get-Content package.json -Raw | ConvertFrom-Json).dependencies) {
-            throw "Runtime dependencies require a committed package-lock.json"
-          }
+          npm.cmd ci --ignore-scripts --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
 
-      - name: Check syntax
+      - name: Check syntax and release contract
         run: npm.cmd run check
 
       - name: Run tests
@@ -72,6 +89,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
             throw "Archive was not created: $archive"
           }
+          $expectedArchive = "elonmark-codex-quota-${{ steps.version.outputs.version }}.tgz"
+          if ((Split-Path -Leaf $archive) -ne $expectedArchive) {
+            throw "Unexpected archive name: $archive"
+          }
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $archive" | Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
           "archive=$archive" >> $env:GITHUB_OUTPUT
@@ -86,9 +107,40 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  prepare-github-release:
+    name: Prepare immutable release assets
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out release helper
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Download release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Create or reconcile draft Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          & .\.github\scripts\reconcile-release.ps1 `
+            -Mode prepare `
+            -AssetsDirectory release-assets `
+            -Tag $env:GITHUB_REF_NAME `
+            -Repository $env:GITHUB_REPOSITORY `
+            -Version $env:RELEASE_VERSION
+
   publish-npm:
     name: Publish to npm (optional)
-    needs: build
+    needs: [build, prepare-github-release]
     if: ${{ vars.PUBLISH_NPM == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 10
@@ -97,10 +149,10 @@ jobs:
       id-token: write
 
     steps:
-      - name: Set up Node.js 24 for npm Trusted Publishing
+      - name: Set up pinned toolchain for npm Trusted Publishing
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 24
+          node-version: "24.18.0"
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
@@ -110,64 +162,132 @@ jobs:
           name: release-assets
           path: release-assets
 
-      - name: Publish with provenance
+      - name: Publish and verify exact archive with provenance
         shell: pwsh
+        env:
+          PACKAGE_NAME: "@elonmark/codex-quota"
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          $npmVersion = [version](npm.cmd --version)
-          if ($npmVersion -lt [version]"11.5.1") {
-            throw "npm 11.5.1 or newer is required for Trusted Publishing; found $npmVersion"
-          }
+          $npmVersion = (npm.cmd --version).Trim()
+          if ($npmVersion -ne '11.16.0') { throw "Expected npm 11.16.0; found $npmVersion" }
           $archives = @(Get-ChildItem -LiteralPath release-assets -Filter *.tgz -File)
           if ($archives.Count -ne 1) { throw "Expected exactly one npm archive" }
           $archive = $archives[0].FullName
+          $localShasum = (Get-FileHash -LiteralPath $archive -Algorithm SHA1).Hash.ToLowerInvariant()
+          $sha512 = [System.Security.Cryptography.SHA512]::Create()
+          try {
+            $localIntegrity = "sha512-" + [Convert]::ToBase64String($sha512.ComputeHash([IO.File]::ReadAllBytes($archive)))
+          } finally {
+            $sha512.Dispose()
+          }
+          $encodedName = [Uri]::EscapeDataString($env:PACKAGE_NAME)
+          $packumentUri = "$($env:NPM_CONFIG_REGISTRY.TrimEnd('/'))/$encodedName"
+
+          function Read-Packument {
+            try {
+              $cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+              return Invoke-RestMethod -Uri "$packumentUri`?codexQuota=$cacheBust" -Method Get -Headers @{ Accept = "application/json"; "Cache-Control" = "no-cache" }
+            } catch {
+              $response = $_.Exception.Response
+              if ($null -ne $response -and [int]$response.StatusCode -eq 404) { return $null }
+              throw
+            }
+          }
+
+          function Get-PublishedVersion([object]$Packument) {
+            if ($null -eq $Packument) { return $null }
+            $property = $Packument.versions.PSObject.Properties[$env:RELEASE_VERSION]
+            if ($null -eq $property) { return $null }
+            return $property.Value
+          }
+
+          function Assert-Publication([object]$Packument, [object]$Published) {
+            if (([string]$Published.dist.shasum).ToLowerInvariant() -ne $localShasum) {
+              throw "npm contains $env:PACKAGE_NAME@$env:RELEASE_VERSION with a different SHA-1"
+            }
+            if ([string]$Published.dist.integrity -ne $localIntegrity) {
+              throw "npm contains $env:PACKAGE_NAME@$env:RELEASE_VERSION with a different SHA-512 integrity"
+            }
+            $latest = [string]$Packument.'dist-tags'.latest
+            if ($latest -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+              throw "npm latest is missing or is not a stable version: $latest"
+            }
+            if ([version]$latest -lt [version]$env:RELEASE_VERSION) {
+              throw "npm latest is older than the verified publication"
+            }
+            if ([string]$Published.dist.attestations.provenance.predicateType -ne 'https://slsa.dev/provenance/v1') {
+              throw "npm publication is missing OIDC provenance"
+            }
+          }
+
+          $packument = Read-Packument
+          $published = Get-PublishedVersion $packument
+          if ($null -ne $published) {
+            Assert-Publication $packument $published
+            Write-Host "npm already contains the complete verified publication."
+            exit 0
+          }
+
+          $currentLatest = [string]$packument.'dist-tags'.latest
+          if ($currentLatest) {
+            if ($currentLatest -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+              throw "Refusing to publish while npm latest is not a stable version: $currentLatest"
+            }
+            if ([version]$currentLatest -ge [version]$env:RELEASE_VERSION) {
+              throw "Refusing to publish $env:RELEASE_VERSION after npm latest $currentLatest"
+            }
+          }
+
           npm.cmd publish $archive --access public --provenance
           if ($LASTEXITCODE -ne 0) { throw "npm publish failed" }
 
+          $lastError = $null
+          for ($attempt = 1; $attempt -le 20; $attempt += 1) {
+            try {
+              $packument = Read-Packument
+              $published = Get-PublishedVersion $packument
+              if ($null -ne $published) {
+                Assert-Publication $packument $published
+                Write-Host "npm publication, latest tag, integrity, and provenance are verified."
+                exit 0
+              }
+            } catch {
+              $lastError = $_
+            }
+            Start-Sleep -Seconds 3
+          }
+          if ($null -ne $lastError) { throw $lastError }
+          throw "npm publication did not become visible before the verification timeout"
+
   github-release:
     name: Publish GitHub Release
-    needs: [build, publish-npm]
-    if: ${{ always() && needs.build.result == 'success' && (needs.publish-npm.result == 'success' || needs.publish-npm.result == 'skipped') }}
+    needs: [build, prepare-github-release, publish-npm]
+    if: ${{ always() && needs.build.result == 'success' && needs.prepare-github-release.result == 'success' && (needs.publish-npm.result == 'success' || needs.publish-npm.result == 'skipped') }}
     runs-on: windows-latest
     timeout-minutes: 10
     permissions:
       contents: write
 
     steps:
+      - name: Check out release helper
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
       - name: Download release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-assets
           path: release-assets
 
-      - name: Verify archive checksum
-        shell: pwsh
-        run: |
-          $archives = @(Get-ChildItem -LiteralPath release-assets -Filter *.tgz -File)
-          if ($archives.Count -ne 1) { throw "Expected exactly one npm archive" }
-          $archive = $archives[0]
-          $checksumPath = "$($archive.FullName).sha256"
-          if (-not (Test-Path -LiteralPath $checksumPath -PathType Leaf)) {
-            throw "Checksum asset is missing"
-          }
-          $expected = ((Get-Content -LiteralPath $checksumPath -Raw) -split '\s+')[0].ToLowerInvariant()
-          $actual = (Get-FileHash -LiteralPath $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected) { throw "Release archive SHA-256 mismatch" }
-
-      - name: Create or update GitHub Release
+      - name: Verify and publish prepared Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ needs.build.outputs.version }}
         run: |
-          $archives = @(Get-ChildItem -LiteralPath release-assets -Filter *.tgz -File)
-          $archive = $archives[0].FullName
-          $checksum = "$archive.sha256"
-          $tag = [string]$env:GITHUB_REF_NAME
-          $repository = [string]$env:GITHUB_REPOSITORY
-          & gh release view $tag --repo $repository *> $null
-          if ($LASTEXITCODE -eq 0) {
-            & gh release upload $tag $archive $checksum --clobber --repo $repository
-          } else {
-            & gh release create $tag $archive $checksum --repo $repository --verify-tag --generate-notes --title "Codex Quota $env:RELEASE_VERSION"
-          }
-          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed" }
+          & .\.github\scripts\reconcile-release.ps1 `
+            -Mode finalize `
+            -AssetsDirectory release-assets `
+            -Tag $env:GITHUB_REF_NAME `
+            -Repository $env:GITHUB_REPOSITORY `
+            -Version $env:RELEASE_VERSION

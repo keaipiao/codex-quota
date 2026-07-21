@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-21
+
+### Changed
+
+- The public executable is now `codex-quota`, matching the repository and npm
+  package name. The temporary `codex-q` abbreviation has been removed.
+- Installation and recovery messages now use commands that work directly
+  through the scoped npm package, and the default installation message simply
+  tells users to open **Codex + Quota**.
+- Documentation now distinguishes normal `npx` use from commands run inside a
+  source checkout and makes the every-cold-start requirement explicit.
+
+### Fixed
+
+- The tag release workflow now accepts stable versions only, verifies that a
+  tag belongs to the default branch, validates the exact public package
+  contract, publishes npm idempotently, and never overwrites mismatched GitHub
+  Release assets.
+- Regression tests now reject the retired executable name and verify the packed
+  command surface.
+
 ## [0.3.1] - 2026-07-21
 
 ### Fixed

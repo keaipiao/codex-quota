@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -43,11 +43,12 @@ test("public package scope and executable names cannot invoke unrelated packages
   assert.equal(metadata.name, "@elonmark/codex-quota");
   assert.deepEqual(metadata.os, ["win32"]);
   assert.deepEqual(metadata.cpu, ["x64"]);
-  assert.deepEqual(Object.keys(metadata.bin), ["codex-q"]);
-  assert.equal(metadata.bin["codex-q"], "bin/codex-q.mjs");
-  assert.equal(metadata.bin["codex-quota"], undefined);
+  assert.deepEqual(Object.keys(metadata.bin), ["codex-quota"]);
+  assert.equal(metadata.bin["codex-quota"], "bin/codex-quota.mjs");
+  assert.equal(metadata.bin["codex-q"], undefined);
   assert.equal(metadata.author, "keaipiao");
   assert.equal(metadata.repository.url, "git+https://github.com/keaipiao/codex-quota.git");
+  assert.equal(metadata.publishConfig.registry, "https://registry.npmjs.org/");
   assert.ok(metadata.files.includes("README.zh-CN.md"));
   assert.equal(lock.name, metadata.name);
   assert.equal(lock.packages[""].name, metadata.name);
@@ -60,6 +61,26 @@ test("public package scope and executable names cannot invoke unrelated packages
     assert.doesNotMatch(contents, /npx(?:\.cmd)?\s+(?:--yes\s+)?codex-q(?:\s|@|$)/i);
   }
   assert.match(readme, /npx\.cmd --yes @elonmark\/codex-quota@latest install/);
+  assert.deepEqual(await readdir(join(PACKAGE_ROOT, "bin")), ["codex-quota.mjs"]);
+});
+
+test("current public instructions and runtime messages contain no retired CLI abbreviation", async () => {
+  const currentPublicFiles = [
+    "package.json",
+    "package-lock.json",
+    "README.md",
+    "README.zh-CN.md",
+    "CONTRIBUTING.md",
+    "docs/RELEASING.md",
+    ".github/ISSUE_TEMPLATE/bug_report.yml",
+    "bin/codex-quota.mjs",
+    "src/cli.mjs",
+    "windows/hidden-launch.ps1"
+  ];
+  for (const path of currentPublicFiles) {
+    const contents = await readFile(join(PACKAGE_ROOT, path), "utf8");
+    assert.doesNotMatch(contents, /\bcodex-q(?!uota)\b/i, path);
+  }
 });
 
 test("unknown commands produce a coded human error and a nonzero result", async () => {
@@ -87,8 +108,8 @@ test("the conventional global --version form returns the package version", async
   const { capture, io } = captureIo();
   const result = await main(["--version"], io);
   assert.equal(result.ok, true);
-  assert.equal(result.version, "0.3.1");
-  assert.equal(capture.stdout, "0.3.1\n");
+  assert.equal(result.version, "0.4.0");
+  assert.equal(capture.stdout, "0.4.0\n");
 });
 
 test("--json produces one structured error result and marks failure", async () => {
@@ -107,7 +128,7 @@ test("--json produces one structured error result and marks failure", async () =
 });
 
 test("the published executable returns a nonzero status for structured and human errors", () => {
-  const entry = join(PACKAGE_ROOT, "bin", "codex-q.mjs");
+  const entry = join(PACKAGE_ROOT, "bin", "codex-quota.mjs");
   const json = spawnSync(process.execPath, [entry, "not-a-command", "--json"], { encoding: "utf8" });
   assert.equal(json.status, 1);
   assert.equal(JSON.parse(json.stdout).error.code, "E_UNKNOWN_COMMAND");
@@ -140,7 +161,8 @@ test("--no-shortcuts install output does not claim a shortcut was created", () =
   }, io);
   assert.match(capture.stdout, /Installation does not start Codex/);
   assert.match(capture.stdout, /Shortcuts were not created/);
-  assert.match(capture.stdout, /codex-q start/);
+  assert.match(capture.stdout, /npx\.cmd --yes @elonmark\/codex-quota@latest start/);
+  assert.doesNotMatch(capture.stdout, /\bcodex-q(?!uota)\b/i);
   assert.doesNotMatch(capture.stdout, /Launch it with/);
 });
 
@@ -148,12 +170,13 @@ test("default install output says to open the shortcut without a second command"
   const { capture, io } = captureIo();
   emitInstallHuman({
     ok: true,
-    install: { version: "0.3.1", engineRoot: "C:\\runtime" },
+    install: { version: "0.4.0", engineRoot: "C:\\runtime" },
     shortcuts: { created: [] }
   }, io);
   assert.match(capture.stdout, /Installation does not start Codex/);
   assert.match(capture.stdout, /open the 'Codex \+ Quota' shortcut directly/);
-  assert.match(capture.stdout, /do not need to run 'codex-q start'/);
+  assert.doesNotMatch(capture.stdout, /do not need to run/i);
+  assert.doesNotMatch(capture.stdout, /\bcodex-q(?!uota)\b/i);
 });
 
 test("uninstall result preserves shortcut ownership mismatches for callers", async () => {
@@ -208,6 +231,7 @@ test("shortcut scripts use the hidden static launcher and transactional owned re
   }
   assert.match(hidden, /& \$resolvedNode \$entryPoint start --installed/);
   assert.match(hidden, /launcher-error\.log/);
+  assert.match(hidden, /npx\.cmd --yes @elonmark\/codex-quota@latest doctor --live/);
   assert.match(hidden, /%LOCALAPPDATA%/);
   assert.match(hidden, /%USERPROFILE%/);
 });

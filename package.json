@@ -1,10 +1,10 @@
 {
   "name": "@elonmark/codex-quota",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "A local, no-tray quota panel for the Windows Codex desktop app.",
   "type": "module",
   "bin": {
-    "codex-q": "bin/codex-q.mjs"
+    "codex-quota": "bin/codex-quota.mjs"
   },
   "os": [
     "win32"
@@ -29,11 +29,10 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "node scripts/check-syntax.mjs",
+    "check": "node scripts/check-syntax.mjs && node scripts/verify-release.mjs",
     "prepack": "npm run check && npm test"
   },
   "keywords": [
-    "codex-q",
     "codex-quota",
     "codex",
     "chatgpt",
@@ -53,6 +52,7 @@
   },
   "publishConfig": {
     "access": "public",
-    "provenance": true
+    "provenance": true,
+    "registry": "https://registry.npmjs.org/"
   }
 }
