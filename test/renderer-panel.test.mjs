@@ -243,7 +243,9 @@ function createEnvironment(options = {}) {
 
     const layout = new FakeElement("div", rect(0, 800));
     const exactBottomRoot = overrides.exactBottomRoot ?? options.exactBottomRoot;
-    if (exactBottomRoot) layout.className = "absolute inset-x-0 bottom-0 z-20";
+    layout.className = exactBottomRoot
+      ? "absolute inset-x-0 bottom-0 z-20"
+      : "flex h-full min-h-0 flex-col overflow-hidden";
     layout._computed = {
       display: "flex",
       flexDirection: "column",
@@ -1058,6 +1060,66 @@ test("settings-style sidebar detach and reattach reuses the document-lifetime pa
   assert.match(textTree(restoredHost._shadow), /75%/);
 });
 
+test("settings return keeps the restored card visible through delayed layout samples", () => {
+  const environment = createEnvironment({ queueAnimationFrames: true });
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+
+  assert.equal(environment.detachSurface(), true);
+  const restoredSurface = environment.attachSurface("docked");
+  assert.equal(restoredSurface.layout.children.at(-2), originalHost);
+  assert.equal(originalHost.style.display, "block");
+
+  // React can report a pre-settle scroll region in the frames immediately
+  // after the route returns. A validated document-lifetime host must remain
+  // projected while that geometry catches up.
+  restoredSurface.scroller._rect = rect(60, 720);
+  environment.flushAnimationFrames();
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, false);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(originalHost.parentElement, restoredSurface.layout);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+
+  environment.advance(80);
+  const transientReconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(transientReconcile);
+  transientReconcile.active = false;
+  transientReconcile.callback();
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(originalHost.style.display, "block");
+
+  restoredSurface.scroller._rect = rect(60, 700);
+  environment.advance(80);
+  const stableReconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(stableReconcile);
+  stableReconcile.active = false;
+  stableReconcile.callback();
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, restoredSurface.layout);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(environment.shadowAttachCount, 1);
+});
+
 test("docked and floating sidebar transitions move the same pre-rendered panel", () => {
   const environment = createEnvironment();
   environment.evaluate();
@@ -1087,7 +1149,7 @@ test("docked and floating sidebar transitions move the same pre-rendered panel",
   assert.match(textTree(restoredHost._shadow), /75%/);
 });
 
-test("a newly connected zero-width docked sidebar is prepared before an exiting floating sidebar", () => {
+test("a newly connected zero-width docked sidebar never steals the panel from a visible surface", () => {
   const environment = createEnvironment({ initialSurface: "floating" });
   environment.evaluate();
   const api = environment.window.__CODEX_QUOTA_PANEL__;
@@ -1099,13 +1161,16 @@ test("a newly connected zero-width docked sidebar is prepared before an exiting 
   const docked = environment.attachSurface("docked", {
     sidebarRect: rect(0, 0, 0),
   });
-  const preparedHost = docked.layout.children.at(-2);
-  assert.equal(api.status().sidebarSurface, "docked");
-  assert.equal(api.status().visible, false);
-  assert.equal(preparedHost, originalHost);
-  assert.equal(preparedHost._shadow, originalShadow);
-  assert.equal(floating.layout.children.includes(originalHost), false);
-  assert.match(textTree(preparedHost._shadow), /75%/);
+  assert.equal(api.status().sidebarSurface, "floating");
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(floating.layout.children.at(-2), originalHost);
+  assert.equal(docked.layout.children.includes(originalHost), false);
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.match(textTree(originalHost._shadow), /75%/);
 
   docked.sidebar._rect = rect(0, 800);
   docked.sidebar.clientWidth = 260;
@@ -1115,13 +1180,394 @@ test("a newly connected zero-width docked sidebar is prepared before an exiting 
   ));
   assert.ok(resizeObserver);
   resizeObserver.callback();
-  const reconcile = environment.timeouts.find((entry) => entry.active && entry.milliseconds === 80);
-  assert.ok(reconcile);
-  reconcile.callback();
 
+  assert.equal(api.status().sidebarSurface, "docked");
   assert.equal(api.status().visible, true);
   assert.equal(api.status().geometryValidated, true);
   assert.equal(docked.layout.children.at(-2), originalHost);
+  assert.equal(floating.layout.children.includes(originalHost), false);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(environment.shadowAttachCount, 1);
+});
+
+test("a visible incomplete sidebar receives a provisional card during cross-surface handoff", () => {
+  const environment = createEnvironment();
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+
+  const target = environment.attachSurface("floating", { ariaHidden: true });
+  const toolbar = new FakeElement("div", rect(0, 48));
+  const contentWrapper = new FakeElement("div", rect(48, 800));
+  contentWrapper.className = "min-h-0 flex-1 overflow-hidden";
+  target.sidebar.removeChild(target.layout);
+  target.sidebar.appendChild(toolbar);
+  target.sidebar.appendChild(contentWrapper);
+  contentWrapper.appendChild(target.layout);
+  target.layout.removeChild(target.scroller);
+  target.layout.removeChild(target.footer);
+
+  environment.sidebar.setAttribute("aria-hidden", "true");
+  target.sidebar.removeAttribute("aria-hidden");
+  environment.notifyRootMutation([
+    {
+      type: "attributes",
+      target: environment.sidebar,
+      attributeName: "aria-hidden",
+    },
+    {
+      type: "attributes",
+      target: target.sidebar,
+      attributeName: "aria-hidden",
+    },
+    {
+      type: "childList",
+      target: target.layout,
+      addedNodes: [],
+      removedNodes: [target.scroller, target.footer],
+    },
+  ]);
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, false);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(originalHost.parentElement, target.layout);
+  assert.equal(originalHost.parentElement === target.sidebar, false);
+  assert.equal(target.sidebar.children[0], toolbar);
+  assert.equal(environment.layout.contains(originalHost), false);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+
+  const provisionalObserver = environment.resizeObservers.find((entry) => (
+    !entry.disconnected && entry.targets.includes(target.sidebar)
+  ));
+  assert.ok(provisionalObserver);
+  const observerCount = environment.resizeObservers.length;
+  provisionalObserver.callback();
+  assert.equal(environment.resizeObservers.length, observerCount);
+  assert.equal(provisionalObserver.disconnected, false);
+  assert.equal(api.status().visible, true);
+  assert.equal(originalHost.parentElement, target.layout);
+  assert.equal(originalHost.style.display, "block");
+
+  environment.advance(40);
+  const bottomRoot = new FakeElement("div", rect(700, 800));
+  bottomRoot.className = "absolute inset-x-0 bottom-0 z-20";
+  bottomRoot._computed = {
+    display: "flex",
+    flexDirection: "column",
+    position: "absolute",
+    overflowY: "visible",
+  };
+  target.layout.appendChild(target.scroller);
+  target.layout.appendChild(bottomRoot);
+  bottomRoot.appendChild(target.footer);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: target.layout,
+    addedNodes: [target.scroller, bottomRoot],
+    removedNodes: [],
+  }]);
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, bottomRoot);
+  assert.equal(originalHost.nextSibling, target.footer);
+  assert.equal(originalHost.style.marginBlockStart, "0");
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(environment.shadowAttachCount, 1);
+});
+
+test("replacing the host layout shell keeps the card in the new visible shell", () => {
+  const environment = createEnvironment();
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+  const replacementLayout = new FakeElement("div", rect(0, 800));
+  replacementLayout.className = "flex h-full min-h-0 flex-col overflow-hidden";
+  replacementLayout._computed = {
+    display: "flex",
+    flexDirection: "column",
+    position: "static",
+    overflowY: "visible",
+  };
+  const motionWrapper = new FakeElement("div", rect(0, 800));
+  motionWrapper.className = "max-w-full overflow-hidden";
+  const resizeHandle = new FakeElement("div", rect(0, 800, 4, 256));
+  motionWrapper.appendChild(replacementLayout);
+
+  environment.sidebar.removeChild(environment.layout);
+  environment.sidebar.appendChild(motionWrapper);
+  environment.sidebar.appendChild(resizeHandle);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: environment.sidebar,
+    addedNodes: [motionWrapper, resizeHandle],
+    removedNodes: [environment.layout],
+  }]);
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, false);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(originalHost.parentElement, replacementLayout);
+  assert.equal(originalHost.parentElement === environment.sidebar, false);
+  assert.equal(environment.sidebar.children.at(-1), resizeHandle);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+
+  environment.advance(40);
+  replacementLayout.appendChild(environment.scroller);
+  replacementLayout.appendChild(environment.footer);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: replacementLayout,
+    addedNodes: [environment.scroller, environment.footer],
+    removedNodes: [],
+  }]);
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, replacementLayout);
+  assert.equal(originalHost.nextSibling, environment.footer);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(environment.shadowAttachCount, 1);
+});
+
+test("transient post-route layout settling never parks an already visible panel", () => {
+  const environment = createEnvironment({ queueAnimationFrames: true });
+  environment.scroller._computed.paddingBottom = "8px";
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+
+  environment.scroller._rect = rect(60, 720);
+  environment.flushAnimationFrames();
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, false);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(environment.layout.children.at(-2), originalHost);
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.match(textTree(originalHost._shadow), /75%/);
+
+  environment.advance(80);
+  const settlingReconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(settlingReconcile);
+  settlingReconcile.active = false;
+  settlingReconcile.callback();
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, false);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.style.display, "block");
+
+  environment.scroller._rect = rect(60, 700);
+  environment.advance(80);
+  const reconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(reconcile);
+  reconcile.active = false;
+  reconcile.callback();
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(environment.layout.children.at(-2), originalHost);
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(environment.shadowAttachCount, 1);
+});
+
+test("a layout that never settles is hidden after the bounded grace period", () => {
+  const environment = createEnvironment({ queueAnimationFrames: true });
+  environment.scroller._computed.paddingBottom = "8px";
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+
+  environment.scroller._rect = rect(60, 720);
+  environment.flushAnimationFrames();
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+
+  for (let elapsed = 80; elapsed <= 560; elapsed += 80) {
+    const activeReconciles = environment.timeouts
+      .filter((entry) => entry.active && entry.milliseconds === 80);
+    assert.equal(activeReconciles.length, 1);
+    environment.advance(80);
+    activeReconciles[0].active = false;
+    activeReconciles[0].callback();
+    assert.equal(api.status().projectionMode, "projected");
+    assert.equal(api.status().reason, "layout-settling");
+    assert.equal(originalHost.style.display, "block");
+  }
+
+  const finalReconciles = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80);
+  assert.equal(finalReconciles.length, 1);
+  environment.advance(80);
+  finalReconciles[0].active = false;
+  finalReconciles[0].callback();
+
+  assert.equal(api.status().mounted, false);
+  assert.equal(api.status().visible, false);
+  assert.equal(api.status().projectionMode, "parked");
+  assert.equal(api.status().reason, "panel-overlaps-conversation-scroll-region");
+  assert.equal(originalHost.parentElement, environment.body);
+  assert.equal(originalHost.style.display, "none");
+  assert.equal(originalHost.getAttribute("aria-hidden"), "true");
+  assert.equal(originalHost.inert, true);
+  assert.equal(
+    environment.timeouts.filter((entry) => entry.active && entry.milliseconds === 80).length,
+    0,
+  );
+  assert.equal(
+    environment.timeouts.filter((entry) => entry.active && entry.milliseconds === 100).length,
+    0,
+  );
+
+  const lifecycleObserver = environment.observers.find((entry) => (
+    !entry.disconnected && entry.target === environment.root
+  ));
+  const unrelated = new FakeElement("div", rect(0, 10));
+  lifecycleObserver.callback([
+    {
+      type: "childList",
+      target: environment.layout,
+      addedNodes: [],
+      removedNodes: [originalHost],
+    },
+    {
+      type: "childList",
+      target: environment.body,
+      addedNodes: [unrelated],
+      removedNodes: [],
+    },
+  ]);
+  assert.equal(api.status().projectionMode, "parked");
+  assert.equal(api.status().mounted, false);
+  assert.equal(originalHost.parentElement, environment.body);
+  assert.equal(originalHost.style.display, "none");
+
+  api.heartbeat();
+  assert.equal(api.status().projectionMode, "parked");
+  assert.equal(api.status().mounted, false);
+  assert.equal(originalHost.parentElement, environment.body);
+  assert.equal(originalHost.style.display, "none");
+
+  const recoveryObserver = environment.resizeObservers.find((entry) => (
+    !entry.disconnected
+    && entry.targets.length === 1
+    && entry.targets[0] === environment.sidebar
+  ));
+  assert.ok(recoveryObserver);
+  recoveryObserver.callback();
+  assert.equal(api.status().projectionMode, "parked");
+  assert.equal(originalHost.style.display, "none");
+
+  // Restoring the inner scroll dock is not enough to unlock the latch. That
+  // same inner resize also happens when parking the panel restores its space.
+  environment.scroller._rect = rect(60, 700);
+  recoveryObserver.callback();
+  assert.equal(api.status().projectionMode, "parked");
+  assert.equal(originalHost.style.display, "none");
+
+  // A real outer-surface resize is an independent recovery signal.
+  environment.sidebar._rect = rect(0, 800, 280);
+  environment.sidebar.clientWidth = 280;
+  environment.sidebar.scrollWidth = 280;
+  recoveryObserver.callback();
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+});
+
+test("a transient zero-size sample keeps a previously validated panel projected", () => {
+  const environment = createEnvironment();
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+
+  assert.equal(api.status().geometryValidated, true);
+  originalHost._rect = rect(700, 700, 0);
+  api.heartbeat();
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().geometryValidated, false);
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+
+  originalHost._rect = rect(700, 760);
+  environment.advance(80);
+  const reconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(reconcile);
+  reconcile.active = false;
+  reconcile.callback();
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost._shadow, originalShadow);
   assert.equal(environment.shadowAttachCount, 1);
 });
 
@@ -1225,6 +1671,185 @@ test("an externally removed current host is synchronously remounted by the root 
   assert.equal(replacementHost.nextSibling, environment.footer);
   assert.equal(environment.layout.children.filter((element) => element.id === "codex-quota-panel").length, 1);
   assert.match(textTree(replacementHost._shadow), /75%/);
+});
+
+test("replacing the primary scroller rebinds the visible panel without parking it", () => {
+  const environment = createEnvironment();
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+  const oldScroller = environment.scroller;
+  const replacement = new FakeElement("nav", rect(60, 700));
+  replacement.setAttribute("data-app-action-sidebar-scroll", "");
+  replacement._computed = {
+    display: "block",
+    flexDirection: "column",
+    position: "static",
+    overflowY: "auto",
+  };
+  replacement.clientHeight = 640;
+  replacement.scrollHeight = 1_400;
+
+  environment.layout.removeChild(oldScroller);
+  environment.layout.insertBefore(replacement, originalHost);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: environment.layout,
+    addedNodes: [replacement],
+    removedNodes: [oldScroller],
+  }]);
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().scrollDocked, true);
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.nextSibling, environment.footer);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(replacement.style.marginBottom, "var(--sidebar-footer-height)");
+  assert.equal(environment.shadowAttachCount, 1);
+});
+
+test("a staged primary-scroller replacement keeps the visible host in place", () => {
+  const environment = createEnvironment();
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+  const oldScroller = environment.scroller;
+
+  environment.layout.removeChild(oldScroller);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: environment.layout,
+    addedNodes: [],
+    removedNodes: [oldScroller],
+  }]);
+
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+
+  environment.advance(80);
+  const settlingReconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(settlingReconcile);
+  settlingReconcile.active = false;
+  settlingReconcile.callback();
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(originalHost.style.display, "block");
+
+  const replacement = new FakeElement("nav", rect(60, 700));
+  replacement.setAttribute("data-app-action-sidebar-scroll", "");
+  replacement._computed = {
+    display: "block",
+    flexDirection: "column",
+    position: "static",
+    overflowY: "auto",
+  };
+  replacement.clientHeight = 640;
+  replacement.scrollHeight = 1_400;
+  environment.layout.insertBefore(replacement, originalHost);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: environment.layout,
+    addedNodes: [replacement],
+    removedNodes: [],
+  }]);
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.nextSibling, environment.footer);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(replacement.style.marginBottom, "var(--sidebar-footer-height)");
+  assert.equal(environment.shadowAttachCount, 1);
+});
+
+test("a staged account-footer replacement keeps the visible host in place", () => {
+  const environment = createEnvironment();
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const originalHost = environment.layout.children.at(-2);
+  const originalShadow = originalHost._shadow;
+  const footer = environment.footer;
+
+  environment.layout.removeChild(footer);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: environment.layout,
+    addedNodes: [],
+    removedNodes: [footer],
+  }]);
+
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, "layout-settling");
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+
+  environment.advance(80);
+  const settlingReconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(settlingReconcile);
+  settlingReconcile.active = false;
+  settlingReconcile.callback();
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(originalHost.style.display, "block");
+
+  environment.layout.appendChild(footer);
+  environment.notifyRootMutation([{
+    type: "childList",
+    target: environment.layout,
+    addedNodes: [footer],
+    removedNodes: [],
+  }]);
+
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().visible, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.style.display, "block");
+  environment.advance(80);
+  const finalReconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(finalReconcile);
+  finalReconcile.active = false;
+  finalReconcile.callback();
+  assert.equal(api.status().geometryValidated, true);
+  assert.equal(api.status().projectionMode, "projected");
+  assert.equal(api.status().reason, null);
+  assert.equal(originalHost.parentElement, environment.layout);
+  assert.equal(originalHost.nextSibling, footer);
+  assert.equal(originalHost.style.display, "block");
+  assert.equal(originalHost.hasAttribute("aria-hidden"), false);
+  assert.equal(originalHost.inert, false);
+  assert.equal(originalHost._shadow, originalShadow);
+  assert.equal(environment.shadowAttachCount, 1);
 });
 
 test("an existing zero-size floating sidebar is preloaded before an attribute makes it visible", () => {
@@ -1696,9 +2321,55 @@ test("layout validation fails closed instead of silently clipping panel content"
   panel.clientHeight = 120;
   panel.scrollHeight = 151;
 
-  const result = api.heartbeat();
-  assert.equal(result.mounted, false);
-  assert.equal(result.reason, "panel-content-vertically-clipped");
+  const settling = api.heartbeat();
+  assert.equal(settling.mounted, true);
+  assert.equal(settling.geometryValidated, false);
+  assert.equal(settling.reason, "layout-settling");
+  environment.advance(600);
+  const reconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(reconcile);
+  reconcile.active = false;
+  reconcile.callback();
+  assert.equal(api.status().mounted, false);
+  assert.equal(api.status().reason, "panel-content-vertically-clipped");
+});
+
+test("a blocked panel retries when its rendered content becomes shorter", () => {
+  const environment = createEnvironment();
+  environment.evaluate();
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  api.update(snapshot(1_800_000_000_000));
+  const host = environment.layout.children.at(-2);
+  const panel = findTree(host._shadow, (element) => element.className === "quota-panel");
+  panel.clientHeight = 120;
+  panel.scrollHeight = 151;
+
+  api.heartbeat();
+  environment.advance(600);
+  const reconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(reconcile);
+  reconcile.active = false;
+  reconcile.callback();
+  assert.equal(api.status().projectionMode, "parked");
+  assert.equal(api.status().reason, "panel-content-vertically-clipped");
+
+  const shorterSnapshot = snapshot(1_800_000_000_100);
+  shorterSnapshot.buckets[0].windows = [shorterSnapshot.buckets[0].windows[0]];
+  panel.scrollHeight = 120;
+  const recovered = api.update(shorterSnapshot);
+
+  assert.equal(recovered.mounted, true);
+  assert.equal(recovered.visible, true);
+  assert.equal(recovered.geometryValidated, true);
+  assert.equal(recovered.projectionMode, "projected");
+  assert.equal(recovered.reason, null);
+  assert.equal(host.parentElement, environment.layout);
+  assert.equal(host.style.display, "block");
+  assert.equal(environment.shadowAttachCount, 1);
 });
 
 test("pre-existing native sidebar overflow is tolerated unless the panel increases it", () => {
@@ -1708,9 +2379,19 @@ test("pre-existing native sidebar overflow is tolerated unless the panel increas
   assert.equal(initial.mounted, true);
 
   environment.sidebar.scrollWidth += 3;
-  const increased = environment.window.__CODEX_QUOTA_PANEL__.heartbeat();
-  assert.equal(increased.mounted, false);
-  assert.equal(increased.reason, "sidebar-horizontal-overflow-increased");
+  const api = environment.window.__CODEX_QUOTA_PANEL__;
+  const increased = api.heartbeat();
+  assert.equal(increased.mounted, true);
+  assert.equal(increased.reason, "layout-settling");
+  environment.advance(600);
+  const reconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(reconcile);
+  reconcile.active = false;
+  reconcile.callback();
+  assert.equal(api.status().mounted, false);
+  assert.equal(api.status().reason, "sidebar-horizontal-overflow-increased");
 });
 
 test("reserved padding cannot disguise a scrollbar track that still runs behind the panel", () => {
@@ -1841,7 +2522,19 @@ test("ResizeObserver schedules layout revalidation", () => {
   resizeObserver.callback();
   const reconcileTimeout = environment.timeouts.filter((entry) => entry.active).at(-1);
   assert.equal(reconcileTimeout.milliseconds, 80);
+  reconcileTimeout.active = false;
+  environment.advance(80);
   reconcileTimeout.callback();
+  assert.equal(api.status().mounted, true);
+  assert.equal(api.status().reason, "layout-settling");
+
+  environment.advance(600);
+  const finalReconcile = environment.timeouts
+    .filter((entry) => entry.active && entry.milliseconds === 80)
+    .at(-1);
+  assert.ok(finalReconcile);
+  finalReconcile.active = false;
+  finalReconcile.callback();
   assert.equal(api.status().mounted, false);
   assert.equal(api.status().reason, "panel-content-vertically-clipped");
 });

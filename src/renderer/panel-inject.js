@@ -3,7 +3,7 @@
 
   const GLOBAL_KEY = "__CODEX_QUOTA_PANEL__";
   const CONTROLLER_ID = "codex-quota-sidebar-projection-v1";
-  const VERSION = "0.4.6";
+  const VERSION = "0.4.7";
   const HOST_ID = "codex-quota-panel";
   const SIDEBAR_SELECTORS = Object.freeze([
     "aside.app-shell-left-panel",
@@ -34,6 +34,7 @@
   const LOCALE_CHECK_MS = 5 * 1000;
   const MAX_REACT_FIBERS_FOR_LOCALE = 12_000;
   const RECONCILE_DEBOUNCE_MS = 80;
+  const LAYOUT_SETTLE_GRACE_MS = 600;
   const MOUNT_RETRY_DELAYS_MS = Object.freeze([100, 200, 400, 800, 1_200, 1_600, 2_000, 2_000, 2_000]);
   const MIN_ANCHOR_SCORE = 62;
   const UNIQUE_SCORE_MARGIN = 12;
@@ -345,6 +346,9 @@
   function findActiveSidebar() {
     const surfaces = sidebarSurfaces();
     const connected = new Set(surfaces);
+    if (state.layoutBlockedSidebar && !connected.has(state.layoutBlockedSidebar)) {
+      clearLayoutBlock();
+    }
     for (const previous of state.observedSurfaces) {
       if (connected.has(previous)) continue;
       const metadata = state.surfaceMetadata.get(previous);
@@ -358,9 +362,10 @@
     if (!surfaces.length) return null;
 
     // AnimatePresence may briefly keep an outgoing sidebar beside a newly
-    // connected one. Rank by the latest connection/visibility activation so
-    // edge-hover selects the new floating surface, while a zero-width docked
-    // surface is prepared before its expand animation starts.
+    // connected one. Never move a visible panel into a dormant zero-width
+    // surface. Among surfaces with the same visibility, prefer the latest
+    // activation; if none is visible, this still prepares the newest surface
+    // before its expand animation starts.
     const ranked = surfaces.map((element, index) => {
       let metadata = state.surfaceMetadata.get(element);
       if (!metadata) {
@@ -369,9 +374,13 @@
       }
       const eligible = sidebarIsEligible(element);
       const visible = sidebarIsVisible(element);
-      if (!metadata.connected || (eligible && !metadata.eligible) || (visible && !metadata.visible)) {
+      const reactivated = !metadata.connected
+        || (eligible && !metadata.eligible)
+        || (visible && !metadata.visible);
+      if (reactivated) {
         state.surfaceActivationSequence += 1;
         metadata.activation = state.surfaceActivationSequence;
+        if (state.layoutBlockedSidebar === element) clearLayoutBlock();
       }
       metadata.connected = true;
       metadata.eligible = eligible;
@@ -391,8 +400,8 @@
     const candidates = ranked.filter((entry) => entry.eligible);
     const pool = candidates.length ? candidates : ranked;
     pool.sort((left, right) => (
-      right.activation - left.activation
-      || Number(right.visible) - Number(left.visible)
+      Number(right.visible) - Number(left.visible)
+      || right.activation - left.activation
       || Number(right.floating) - Number(left.floating)
       || right.index - left.index
     ));
@@ -949,6 +958,18 @@
     scrollRegions: null,
     scrollDock: null,
     sidebarBaseline: null,
+    layoutSettleStartedAtMs: null,
+    layoutSettleTargetSidebar: null,
+    layoutSettleFailureReason: null,
+    layoutBlockedSidebar: null,
+    layoutBlockedReason: null,
+    layoutBlockedContainer: null,
+    layoutBlockedAnchor: null,
+    layoutBlockedScrollDock: null,
+    layoutBlockedContentSignature: null,
+    blockedResizeObserver: null,
+    everGeometryValidated: false,
+    projectionEpoch: 0,
     domReadyHandler: null,
     reconcileTimer: null,
     mountRetryTimer: null,
@@ -987,10 +1008,39 @@
       state.host.setAttribute("lang", state.locale);
       state.host.setAttribute("aria-label", messagesFor(state.locale).heading);
     }
+    const contentUnblocked = changed
+      && state.layoutBlockedSidebar
+      && state.layoutBlockedContentSignature !== currentPanelLayoutSignature();
+    if (contentUnblocked) clearLayoutBlock();
     if (changed && renderIfChanged && state.panel && state.host && state.host.isConnected) {
       renderPreservingBottom();
     }
+    if (contentUnblocked && renderIfChanged) scheduleReconcile();
     return changed;
+  }
+
+  function currentPanelLayoutSignature() {
+    const currentFreshness = freshness(
+      state.snapshot,
+      now(),
+      state.explicitlyUnavailable,
+      state.cachedSnapshot || state.heartbeatTimedOut
+    );
+    const bucket = currentFreshness === "unavailable"
+      ? null
+      : selectGeneralBucket(state.snapshot ? state.snapshot.buckets : []);
+    return JSON.stringify([
+      state.locale,
+      currentFreshness,
+      state.cachedSnapshot,
+      state.unavailableReasonCode,
+      bucket && formatPlanLabel(bucket.planType),
+      bucket ? bucket.windows.map((window) => [
+        window.kind,
+        window.durationMinutes,
+        window.resetsAtMs === null,
+      ]) : null,
+    ]);
   }
 
   function render() {
@@ -1474,9 +1524,14 @@
 
   function applyProjectedHostStyle(host) {
     if (!host) return;
-    host.style.cssText = "display:block;position:static;flex:0 0 auto;align-self:stretch;inline-size:auto;max-inline-size:100%;min-inline-size:0;z-index:auto;pointer-events:none;overflow:hidden;";
+    host.style.cssText = "display:block;position:static;flex:0 0 auto;align-self:stretch;margin-block-start:0;inline-size:auto;max-inline-size:100%;min-inline-size:0;z-index:auto;pointer-events:none;overflow:hidden;";
     if (host.hasAttribute("aria-hidden")) host.removeAttribute("aria-hidden");
     host.inert = false;
+  }
+
+  function applyProvisionalHostStyle(host) {
+    applyProjectedHostStyle(host);
+    if (host && host.style) host.style.marginBlockStart = "auto";
   }
 
   function applyParkedHostStyle(host) {
@@ -1484,6 +1539,54 @@
     host.style.cssText = "display:none;position:fixed;inset:auto;inline-size:0;block-size:0;pointer-events:none;overflow:hidden;";
     if (host.getAttribute("aria-hidden") !== "true") host.setAttribute("aria-hidden", "true");
     host.inert = true;
+  }
+
+  function stopBlockedResizeObserver() {
+    if (state.blockedResizeObserver) state.blockedResizeObserver.disconnect();
+    state.blockedResizeObserver = null;
+  }
+
+  function blockedSidebarGeometrySignature(sidebar) {
+    const rect = rectFrom(sidebar);
+    return JSON.stringify([
+      Boolean(sidebar && sidebar.isConnected),
+      rect && rect.top,
+      rect && rect.right,
+      rect && rect.bottom,
+      rect && rect.left,
+      rect && rect.width,
+      rect && rect.height,
+      Number(sidebar && sidebar.clientWidth) || 0,
+      Number(sidebar && sidebar.clientHeight) || 0,
+    ]);
+  }
+
+  function clearLayoutBlock() {
+    stopBlockedResizeObserver();
+    state.layoutBlockedSidebar = null;
+    state.layoutBlockedReason = null;
+    state.layoutBlockedContainer = null;
+    state.layoutBlockedAnchor = null;
+    state.layoutBlockedScrollDock = null;
+    state.layoutBlockedContentSignature = null;
+  }
+
+  function observeBlockedLayoutRecovery(sidebar) {
+    stopBlockedResizeObserver();
+    if (typeof runtime.ResizeObserver !== "function"
+      || !sidebar || !sidebar.isConnected) return;
+    // Observe only the outer surface. Moving our own host out of the sidebar
+    // restores footer/scroller space and can resize those inner nodes; treating
+    // that rollback as recovery creates a visible park/remount loop.
+    const baseline = blockedSidebarGeometrySignature(sidebar);
+    const observer = new runtime.ResizeObserver(() => {
+      if (state.cleaned || state.layoutBlockedSidebar !== sidebar) return;
+      if (blockedSidebarGeometrySignature(sidebar) === baseline) return;
+      clearLayoutBlock();
+      mount();
+    });
+    state.blockedResizeObserver = observer;
+    observer.observe(sidebar);
   }
 
   function ensurePersistentHost() {
@@ -1524,7 +1627,9 @@
   function parkPanel(reason) {
     // Route and responsive transitions park the exact host under body. Its
     // closed shadow root and rendered quota snapshot remain intact.
+    state.projectionEpoch += 1;
     state.projectionMode = "parked";
+    clearReconcileTimer();
     stopResizeObserver();
     restoreScrollDock();
     if (state.host) {
@@ -1537,15 +1642,20 @@
     state.scrollRegions = null;
     state.scrollDock = null;
     state.sidebarBaseline = null;
+    state.layoutSettleStartedAtMs = null;
+    state.layoutSettleTargetSidebar = null;
+    state.layoutSettleFailureReason = null;
     state.geometryValidated = false;
     state.mountedAtMs = null;
     state.anchorScore = null;
     state.reason = reason || "detached";
+    clearLayoutBlock();
   }
 
   function destroyPanel(reason) {
     parkPanel(reason);
     state.projectionMode = "absent";
+    state.everGeometryValidated = false;
     if (state.host && state.host.parentNode) state.host.parentNode.removeChild(state.host);
     state.host = null;
     state.shadow = null;
@@ -1556,6 +1666,10 @@
   function stopLifecycleObserver() {
     if (state.lifecycleObserver) state.lifecycleObserver.disconnect();
     state.lifecycleObserver = null;
+    clearReconcileTimer();
+  }
+
+  function clearReconcileTimer() {
     if (state.reconcileTimer !== null) runtime.clearTimeout(state.reconcileTimer);
     state.reconcileTimer = null;
   }
@@ -1597,32 +1711,60 @@
   }
 
   function surfaceIsHealthy(sidebar = findActiveSidebar()) {
-    return Boolean(state.projectionMode === "projected"
-      && sidebar && sidebar === state.sidebar
-      && state.host && state.host.isConnected
+    return Boolean(hostIsProjectedToSidebar(sidebar)
       && state.anchor && state.anchor.isConnected
+      && state.scrollDock && state.scrollDock.element && state.scrollDock.element.isConnected
       && state.host.parentElement === state.anchor.parentElement
       && state.host.nextSibling === state.anchor);
   }
 
+  function hostIsProjectedToSidebar(sidebar = state.sidebar) {
+    return Boolean(state.projectionMode === "projected"
+      && sidebar && sidebar === state.sidebar && sidebar.isConnected
+      && state.host && state.host.isConnected
+      && typeof sidebar.contains === "function" && sidebar.contains(state.host));
+  }
+
+  function isOwnedHostMutation(record) {
+    if (!record) return false;
+    if (record.type === "attributes") return record.target === state.host;
+    const nodes = [
+      ...Array.from(record.addedNodes || []),
+      ...Array.from(record.removedNodes || []),
+    ];
+    return nodes.length > 0 && nodes.every((node) => state.ownedHosts.has(node));
+  }
+
   function containsOnlyOwnedHostMutations(records) {
     if (!Array.isArray(records) || !records.length) return false;
-    let changedNodeCount = 0;
-    for (const record of records) {
-      if (record && record.type === "attributes") {
-        if (record.target !== state.host) return false;
-        changedNodeCount += 1;
-        continue;
-      }
-      const nodes = [
-        ...Array.from(record && record.addedNodes || []),
-        ...Array.from(record && record.removedNodes || []),
+    return records.every(isOwnedHostMutation);
+  }
+
+  function mutationsTouchBlockedLayout(records) {
+    if (!state.layoutBlockedSidebar || !Array.isArray(records)) return false;
+    const structuralTargets = new Set([
+      state.layoutBlockedSidebar,
+      state.layoutBlockedContainer,
+      state.layoutBlockedAnchor,
+      state.layoutBlockedScrollDock,
+    ].filter(Boolean));
+    return records.some((record) => {
+      // A mixed MutationObserver delivery can contain both a real app change
+      // and the host removal performed by parkPanel(). Ignore our own record
+      // instead of letting its blocked-container target release the latch.
+      if (isOwnedHostMutation(record)) return false;
+      if (structuralTargets.has(record && record.target)) return true;
+      if (!record || record.type !== "childList") return false;
+      const changedNodes = [
+        ...Array.from(record.addedNodes || []),
+        ...Array.from(record.removedNodes || []),
       ];
-      if (!nodes.length) return false;
-      changedNodeCount += nodes.length;
-      if (nodes.some((node) => !state.ownedHosts.has(node))) return false;
-    }
-    return changedNodeCount > 0;
+      return changedNodes.some((node) => {
+        if (structuralTargets.has(node)) return true;
+        if (!node || typeof node.contains !== "function") return false;
+        return Array.from(structuralTargets).some((target) => node.contains(target));
+      });
+    });
   }
 
   function onLifecycleMutation(records) {
@@ -1638,6 +1780,9 @@
       if (sidebar && !surfaceIsHealthy(sidebar)) mount();
       else if (!sidebar && state.host && !state.host.isConnected) parkPanel("sidebar-not-present");
       return;
+    }
+    if (mutationsTouchBlockedLayout(records)) {
+      clearLayoutBlock();
     }
     const renderer = rendererCheck();
     if (!renderer.ok) {
@@ -1684,10 +1829,11 @@
     state.resizeObserver = new runtime.ResizeObserver(() => {
       if (state.cleaned) return;
       const activeSidebar = findActiveSidebar();
-      if (activeSidebar && !surfaceIsHealthy(activeSidebar)) {
+      if (activeSidebar && !hostIsProjectedToSidebar(activeSidebar)) {
         // A dormant surface can become visible through motion-driven geometry
         // without a DOM attribute mutation. Switch surfaces in this callback
-        // before paint; only same-surface validation uses the debounce.
+        // before paint. A provisional host is already on the active surface,
+        // so its observer's initial delivery must not recreate the observer.
         mount();
         return;
       }
@@ -1722,7 +1868,7 @@
     state.domReadyHandler = null;
   }
 
-  function validateCurrentLayout() {
+  function validateCurrentLayout(options = {}) {
     return validateLayout(
       state.sidebar,
       state.anchor,
@@ -1730,8 +1876,209 @@
       state.scrollRegions,
       state.panel,
       state.sidebarBaseline,
-      { scrollDockElement: state.scrollDock && state.scrollDock.element }
+      {
+        ...options,
+        scrollDockElement: state.scrollDock && state.scrollDock.element,
+      }
     );
+  }
+
+  function hasClassTokens(element, requiredTokens) {
+    const tokens = new Set(String(element && element.className || "").split(/\s+/).filter(Boolean));
+    return requiredTokens.every((token) => tokens.has(token));
+  }
+
+  function isColumnLayout(element) {
+    const style = safeComputedStyle(element);
+    const display = String(style.display || "").toLowerCase();
+    const direction = String(style.flexDirection || "").toLowerCase();
+    return display === "flex" && (direction === "column" || direction === "column-reverse");
+  }
+
+  function findProvisionalHostSlot(sidebar, anchorCandidate = null) {
+    if (!sidebar || !sidebar.isConnected) return null;
+    if (anchorCandidate && anchorCandidate.anchor && anchorCandidate.parent
+      && anchorCandidate.anchor.isConnected
+      && anchorCandidate.anchor.parentElement === anchorCandidate.parent
+      && sidebar.contains(anchorCandidate.parent)) {
+      return {
+        parent: anchorCandidate.parent,
+        before: anchorCandidate.anchor,
+        anchor: anchorCandidate.anchor,
+      };
+    }
+
+    const primaryRegions = findScrollRegions(sidebar, null)
+      .filter((region) => region.primary === true
+        && region.element && region.element.isConnected
+        && region.element.parentElement
+        && sidebar.contains(region.element.parentElement)
+        && isColumnLayout(region.element.parentElement));
+    if (primaryRegions.length === 1) {
+      const scroller = primaryRegions[0].element;
+      let before = scroller.nextSibling;
+      if (before === state.host) before = state.host.nextSibling;
+      return {
+        parent: scroller.parentElement,
+        before,
+        anchor: null,
+      };
+    }
+
+    let descendants = [];
+    try { descendants = Array.from(sidebar.querySelectorAll("*")); } catch { descendants = []; }
+    const exactBottomRoots = descendants.filter((element) => (
+      element && element !== state.host && element.isConnected
+      && hasClassTokens(element, ["absolute", "inset-x-0", "bottom-0", "z-20"])
+    ));
+    if (exactBottomRoots.length === 1) {
+      return {
+        parent: exactBottomRoots[0],
+        before: null,
+        anchor: null,
+      };
+    }
+
+    // Docked and floating AppShell variants share this full-height content
+    // column beneath their motion/toolbar wrappers. Restrict provisional
+    // insertion to that stable structural slot: appending directly to the
+    // docked row or before the floating toolbar would visibly misplace it.
+    const contentColumns = descendants.filter((element) => (
+      element && element !== state.host && element.isConnected
+      && hasClassTokens(element, ["flex", "h-full", "min-h-0", "flex-col", "overflow-hidden"])
+      && isColumnLayout(element)
+    ));
+    if (contentColumns.length === 1) {
+      return {
+        parent: contentColumns[0],
+        before: null,
+        anchor: null,
+      };
+    }
+    return null;
+  }
+
+  function projectHostProvisionally(sidebar, anchorCandidate = null) {
+    if (!state.everGeometryValidated || !sidebarIsVisible(sidebar)
+      || !state.host || !state.host.isConnected) return false;
+    const slot = findProvisionalHostSlot(sidebar, anchorCandidate);
+    if (!slot || !slot.parent || !slot.parent.isConnected
+      || (slot.before && slot.before.parentElement !== slot.parent)) return false;
+
+    try {
+      const alreadyPlaced = state.host.parentElement === slot.parent
+        && (slot.before ? state.host.nextSibling === slot.before : state.host.nextSibling === null);
+      if (!alreadyPlaced) {
+        if (slot.before) slot.parent.insertBefore(state.host, slot.before);
+        else slot.parent.appendChild(state.host);
+      }
+    } catch {
+      return false;
+    }
+
+    stopResizeObserver();
+    restoreScrollDock();
+    applyProvisionalHostStyle(state.host);
+    state.sidebar = sidebar;
+    state.anchor = slot.anchor;
+    state.scrollRegions = null;
+    state.scrollDock = null;
+    state.sidebarBaseline = {
+      clientWidth: Number(sidebar.clientWidth) || 0,
+      scrollWidth: Number(sidebar.scrollWidth) || 0,
+    };
+    state.geometryValidated = false;
+    state.anchorScore = null;
+    state.projectionMode = "projected";
+    state.projectionEpoch += 1;
+    observeForResize(sidebar, slot.anchor, state.host, state.panel);
+    return true;
+  }
+
+  function projectedHostCanSettle() {
+    return Boolean(state.everGeometryValidated
+      && hostIsProjectedToSidebar(state.sidebar));
+  }
+
+  function keepProjectedWhileSettling(failureReason, targetSidebar = state.sidebar) {
+    const currentTime = now();
+    if (state.layoutSettleTargetSidebar !== targetSidebar) {
+      state.layoutSettleTargetSidebar = targetSidebar;
+      state.layoutSettleStartedAtMs = currentTime;
+      state.layoutSettleFailureReason = null;
+    } else if (state.layoutSettleStartedAtMs === null) {
+      state.layoutSettleStartedAtMs = currentTime;
+    }
+    if (failureReason && failureReason !== "layout-settling") {
+      state.layoutSettleFailureReason = failureReason;
+    }
+    if (currentTime - state.layoutSettleStartedAtMs < LAYOUT_SETTLE_GRACE_MS) {
+      state.geometryValidated = false;
+      state.reason = "layout-settling";
+      clearMountRetry();
+      scheduleReconcile();
+      return true;
+    }
+
+    const blockedSidebar = targetSidebar;
+    const blockedContainer = state.host && state.host.parentElement;
+    const blockedAnchor = state.anchor;
+    const blockedScrollDockElement = state.scrollDock && state.scrollDock.element;
+    const finalReason = state.layoutSettleFailureReason
+      || failureReason
+      || "layout-validation-failed";
+    parkPanel(finalReason);
+    if (blockedSidebar && blockedSidebar.isConnected) {
+      state.layoutBlockedSidebar = blockedSidebar;
+      state.layoutBlockedReason = finalReason;
+      state.layoutBlockedContainer = blockedContainer;
+      state.layoutBlockedAnchor = blockedAnchor;
+      state.layoutBlockedScrollDock = blockedScrollDockElement;
+      state.layoutBlockedContentSignature = currentPanelLayoutSignature();
+      observeBlockedLayoutRecovery(blockedSidebar);
+    }
+    return false;
+  }
+
+  function applyProjectedValidation(validation, options = {}) {
+    const acceptStableLayout = () => {
+      state.layoutSettleStartedAtMs = null;
+      state.layoutSettleTargetSidebar = null;
+      state.layoutSettleFailureReason = null;
+      state.geometryValidated = true;
+      state.everGeometryValidated = true;
+      state.reason = null;
+      clearLayoutBlock();
+      clearMountRetry();
+      return true;
+    };
+    if (validation.ok && !validation.pending) {
+      return acceptStableLayout();
+    }
+
+    let settlingValidation = validation;
+    if (!settlingValidation.ok) {
+      settlingValidation = validateCurrentLayout({
+        ...options,
+        allowReservedBottomSettle: true,
+      });
+    }
+    if (settlingValidation.ok && !settlingValidation.pending) {
+      return acceptStableLayout();
+    }
+
+    const canSettle = settlingValidation.ok && settlingValidation.pending
+      || projectedHostCanSettle();
+    if (canSettle) {
+      return keepProjectedWhileSettling(
+        validation.reason || settlingValidation.reason || "layout-validation-failed",
+      );
+    }
+
+    const failureReason = validation.reason || settlingValidation.reason || "layout-validation-failed";
+    parkPanel(failureReason);
+    scheduleMountRetry();
+    return false;
   }
 
   function mount() {
@@ -1761,6 +2108,14 @@
       scheduleMountRetry();
       return publicStatus();
     }
+    if (state.layoutBlockedSidebar === sidebar) {
+      if (state.layoutBlockedContentSignature === currentPanelLayoutSignature()) {
+        state.reason = state.layoutBlockedReason || "layout-validation-failed";
+        return publicStatus();
+      }
+      clearLayoutBlock();
+    }
+    if (state.layoutBlockedSidebar) clearLayoutBlock();
     clearDomReadyMount();
 
     if (surfaceIsHealthy(sidebar)) {
@@ -1772,19 +2127,17 @@
         return publicStatus();
       }
       const validation = validateCurrentLayout();
-      if (!validation.ok) {
-        parkPanel(validation.reason);
-        scheduleMountRetry();
-      } else {
-        state.geometryValidated = true;
-        state.reason = null;
-        clearMountRetry();
-      }
+      applyProjectedValidation(validation);
       return publicStatus();
     }
 
     const anchorResult = findAnchor(sidebar);
     if (!anchorResult.candidate) {
+      const provisionallyProjected = projectHostProvisionally(sidebar);
+      if (provisionallyProjected || projectedHostCanSettle()) {
+        keepProjectedWhileSettling(anchorResult.reason, sidebar);
+        return publicStatus();
+      }
       if (!surfaceIsHealthy(state.sidebar)) parkPanel(anchorResult.reason);
       else state.reason = anchorResult.reason;
       scheduleMountRetry();
@@ -1793,6 +2146,11 @@
 
     const { anchor, parent, score } = anchorResult.candidate;
     if (!parent || anchor.parentElement !== parent) {
+      const provisionallyProjected = projectHostProvisionally(sidebar);
+      if (provisionallyProjected || projectedHostCanSettle()) {
+        keepProjectedWhileSettling("anchor-detached", sidebar);
+        return publicStatus();
+      }
       if (!surfaceIsHealthy(state.sidebar)) parkPanel("anchor-detached");
       else state.reason = "anchor-detached";
       scheduleMountRetry();
@@ -1801,6 +2159,11 @@
 
     const scrollRegions = findScrollRegions(sidebar, anchor);
     if (scrollRegions.filter((region) => region.primary === true).length !== 1) {
+      const provisionallyProjected = projectHostProvisionally(sidebar, anchorResult.candidate);
+      if (provisionallyProjected || projectedHostCanSettle()) {
+        keepProjectedWhileSettling("conversation-scroll-dock-not-found", sidebar);
+        return publicStatus();
+      }
       if (!surfaceIsHealthy(state.sidebar)) parkPanel("conversation-scroll-dock-not-found");
       else state.reason = "conversation-scroll-dock-not-found";
       scheduleMountRetry();
@@ -1826,9 +2189,14 @@
     state.projectionMode = "projected";
     state.scrollRegions = scrollRegions;
     state.sidebarBaseline = sidebarBaseline;
+    state.layoutSettleStartedAtMs = null;
+    state.layoutSettleTargetSidebar = null;
+    state.layoutSettleFailureReason = null;
     state.anchorScore = score;
     state.mountedAtMs = now();
     state.reason = null;
+    state.projectionEpoch += 1;
+    const projectionEpoch = state.projectionEpoch;
     render();
 
     const scrollDockElement = applyScrollDock(scrollRegions);
@@ -1855,19 +2223,15 @@
       sidebarBaseline,
       { allowReservedBottomSettle: true, enforceScrollRange: true, scrollDockElement }
     );
-    if (!validation.ok) {
-      parkPanel(validation.reason);
-      scheduleMountRetry();
+    if (!applyProjectedValidation(validation, { enforceScrollRange: true })) {
       return publicStatus();
     }
-    state.geometryValidated = !validation.pending;
-    state.reason = validation.reason;
-    clearMountRetry();
 
     if (typeof runtime.requestAnimationFrame === "function") {
       runtime.requestAnimationFrame(() => runtime.requestAnimationFrame(() => {
         if (!state.host || state.host !== host || state.sidebar !== sidebar
-          || state.anchor !== anchor || host.parentElement !== parent) return;
+          || state.anchor !== anchor || host.parentElement !== parent
+          || state.projectionEpoch !== projectionEpoch) return;
         if (state.scrollDock && state.scrollDock.element === scrollDockElement) {
           alignBottomScrollAnchor(state.scrollDock.bottomAnchor);
         }
@@ -1880,15 +2244,7 @@
           sidebarBaseline,
           { enforceScrollRange: true, scrollDockElement }
         );
-        if (!delayedValidation.ok) {
-          parkPanel(delayedValidation.reason);
-          scheduleMountRetry();
-        }
-        else {
-          state.geometryValidated = true;
-          state.reason = null;
-          clearMountRetry();
-        }
+        applyProjectedValidation(delayedValidation, { enforceScrollRange: true });
       }));
     }
     return publicStatus();
@@ -1927,14 +2283,7 @@
       return publicStatus();
     }
     const validation = validateCurrentLayout();
-    if (!validation.ok) {
-      parkPanel(validation.reason);
-      scheduleMountRetry();
-    } else {
-      state.geometryValidated = true;
-      state.reason = null;
-      clearMountRetry();
-    }
+    applyProjectedValidation(validation);
     return publicStatus();
   }
 
@@ -2051,14 +2400,15 @@
       state.explicitlyUnavailable,
       state.cachedSnapshot || state.heartbeatTimedOut
     );
+    const projected = hostIsProjectedToSidebar(state.sidebar);
     return {
       version: VERSION,
       locale: state.locale,
       formatLocale: state.formatLocale,
       localeSource: state.localeSource,
       injected: Boolean(state.host && state.host.isConnected),
-      mounted: surfaceIsHealthy(state.sidebar),
-      visible: surfaceIsHealthy(state.sidebar) && sidebarIsVisible(state.sidebar),
+      mounted: projected,
+      visible: projected && sidebarIsVisible(state.sidebar),
       freshness: currentFreshness,
       cached: state.cachedSnapshot,
       reason: state.reason,

@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-07-22
+
+### Fixed
+
+- Returning from Settings no longer lets a transient post-render layout sample
+  park and re-show the quota card. The already rendered host remains projected
+  during a bounded settling period and is validated again without a visible
+  hide/show cycle.
+- Staged React handoffs now move that host into the new visible sidebar shell
+  immediately, even when its conversation scroller or account footer arrives
+  a few milliseconds later. Replacing the host's layout wrapper follows the
+  same provisional in-sidebar path instead of briefly parking under `body`.
+- A newly connected zero-width sidebar no longer steals the card from a
+  sidebar that is still visible. The same host moves synchronously when the new
+  surface becomes visible, while an otherwise empty surface is still prepared
+  before expansion.
+- Stale animation-frame validations and queued reconciliation callbacks can no
+  longer act on a newer projection. A layout that genuinely remains invalid is
+  parked once without entering an automatic remount loop.
+
 ## [0.4.6] - 2026-07-22
 
 ### Fixed

@@ -50,7 +50,9 @@ docked, floating-sidebar, and compact-window copies from startup onward,
 independently of quota loading. The custom panel keeps the latest snapshot
 pre-rendered in one document-lifetime host while the sidebar is absent. That
 same host moves into docked and floating sidebars before paint, including
-hidden floating surfaces before their reveal animation.
+hidden floating surfaces before their reveal animation. Brief route and resize
+layout settling keeps an already visible panel in place instead of hiding and
+re-inserting it.
 
 ### Data freshness
 
