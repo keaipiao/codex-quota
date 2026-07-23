@@ -2,10 +2,11 @@
   "use strict";
 
   const GLOBAL_KEY = "__CODEX_QUOTA_PANEL__";
-  const VERSION = "0.4.3";
+  const VERSION = "0.4.4";
   const HOST_ID = "codex-quota-panel";
   const SIDEBAR_SELECTOR = "aside.app-shell-left-panel";
   const NATIVE_HIDDEN_ATTR = "data-codex-quota-native-hidden";
+  const EARLY_NATIVE_GLOBAL_KEY = "__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__";
   const GENERAL_BUCKET_ID = "codex";
   const SPARK_LIMIT_NAME = "gpt-5.3-codex-spark";
   // Compatibility labels for public plans currently represented by the
@@ -31,6 +32,7 @@
   const LOCALE_CHECK_MS = 5 * 1000;
   const MAX_REACT_FIBERS_FOR_LOCALE = 12_000;
   const RECONCILE_DEBOUNCE_MS = 80;
+  const STARTUP_NATIVE_SUPPRESSION_MS = 15_000;
   const MOUNT_RETRY_DELAYS_MS = Object.freeze([100, 200, 400, 800, 1_200, 1_600, 2_000, 2_000, 2_000]);
   const MIN_ANCHOR_SCORE = 62;
   const UNIQUE_SCORE_MARGIN = 12;
@@ -770,6 +772,8 @@
     scrollDock: null,
     sidebarBaseline: null,
     nativeQuotaHidden: new Map(),
+    startupSuppressionUntilMs: now() + STARTUP_NATIVE_SUPPRESSION_MS,
+    startupSuppressionTimer: null,
     domReadyHandler: null,
     reconcileTimer: null,
     mountRetryTimer: null,
@@ -1075,6 +1079,23 @@
     style[camelName] = "";
   }
 
+  function earlyNativeSuppressionActive() {
+    const suppressor = runtime[EARLY_NATIVE_GLOBAL_KEY];
+    if (!suppressor || typeof suppressor.status !== "function") return false;
+    try { return suppressor.status().active === true; } catch { return false; }
+  }
+
+  function cleanupEarlyNativeSuppression(reason = "panel-takeover") {
+    const suppressor = runtime[EARLY_NATIVE_GLOBAL_KEY];
+    if (!suppressor || typeof suppressor.cleanup !== "function") return false;
+    try {
+      suppressor.cleanup(reason);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function restoreScrollDock() {
     const dock = state.scrollDock;
     state.scrollDock = null;
@@ -1217,42 +1238,61 @@
   }
 
   function nativeLowUsageAlertScore(element) {
-    // Codex renders its low core-usage card as a polite status outside the
-    // account footer. Its title reports remaining usage while the native
-    // progress element reports consumed usage; the complementary values keep
-    // this match distinct from generic sidebar status and onboarding cards.
+    // Match the native low-usage component itself, never translated copy. The
+    // current Codex component is a polite status with a two-row header, a
+    // direct native progress element, and an optional action row. Keeping the
+    // signature structural makes it work for every UI language while still
+    // failing closed around unrelated status/progress surfaces.
     if (!element || String(element.getAttribute && element.getAttribute("role") || "").toLowerCase() !== "status"
-      || String(element.getAttribute && element.getAttribute("aria-live") || "").toLowerCase() !== "polite") {
+      || String(element.getAttribute && element.getAttribute("aria-live") || "").toLowerCase() !== "polite"
+      || String(element.tagName || "").toLowerCase() !== "div") {
       return null;
     }
+    const classTokens = new Set(String(element.className || "").split(/\s+/).filter(Boolean));
+    const nativeClassSignature = ["flex", "w-full", "flex-col", "rounded-2xl", "border"];
+    if (!nativeClassSignature.every((token) => classTokens.has(token))) return null;
     let descendants = [];
     try { descendants = Array.from(element.querySelectorAll("*")).slice(0, 80); } catch { descendants = []; }
-    if (!descendants.some((node) => String(node.tagName || "").toLowerCase() === "button")) return null;
+    const children = Array.from(element.children || []);
+    if (children.length < 2 || children.length > 3) return null;
+    const [header, progress, actions] = children;
+    if (String(header && header.tagName || "").toLowerCase() !== "div"
+      || String(progress && progress.tagName || "").toLowerCase() !== "progress") return null;
 
-    const progressNodes = descendants.filter((node) => {
-      const tag = String(node.tagName || "").toLowerCase();
-      const role = String(node.getAttribute && node.getAttribute("role") || "").toLowerCase();
-      return tag === "progress" || role === "progressbar" || role === "meter";
-    });
-    const text = subtreeText(element);
-    const percentages = [];
-    const percentPattern = /(?:([0-9]{1,3}(?:[.,][0-9]+)?)\s*%|%\s*([0-9]{1,3}(?:[.,][0-9]+)?))/g;
-    for (const match of text.matchAll(percentPattern)) {
-      const value = Number(String(match[1] || match[2]).replace(",", "."));
-      if (Number.isFinite(value) && value >= 0 && value <= 100) percentages.push(value);
+    const progressNodes = descendants.filter((node) => String(node.tagName || "").toLowerCase() === "progress");
+    if (progressNodes.length !== 1 || progressNodes[0] !== progress) return null;
+    const maximum = Number(progress.getAttribute && progress.getAttribute("max") || progress.max);
+    const value = Number(progress.getAttribute && progress.getAttribute("value") || progress.value);
+    const progressLabel = String(progress.getAttribute && progress.getAttribute("aria-label") || "").trim();
+    if (!Number.isFinite(maximum) || Math.abs(maximum - 100) > 0.01
+      || !Number.isFinite(value) || value < 0 || value > 100 || !progressLabel) return null;
+
+    const headerChildren = Array.from(header.children || []);
+    if (headerChildren.length < 1 || headerChildren.length > 2) return null;
+    const titleRow = headerChildren[0];
+    if (String(titleRow && titleRow.tagName || "").toLowerCase() !== "div") return null;
+    const titleChildren = Array.from(titleRow.children || []);
+    if (titleChildren.length !== 2
+      || String(titleChildren[0].tagName || "").toLowerCase() !== "span"
+      || String(titleChildren[1].tagName || "").toLowerCase() !== "button") return null;
+    const dismiss = titleChildren[1];
+    const dismissType = String(dismiss.getAttribute && dismiss.getAttribute("type") || "").toLowerCase();
+    const dismissLabel = String(dismiss.getAttribute && dismiss.getAttribute("aria-label") || "").trim();
+    const dismissClassTokens = new Set(String(dismiss.className || "").split(/\s+/).filter(Boolean));
+    if (dismissType !== "button" || !dismissLabel || !dismissClassTokens.has("no-drag")) return null;
+    if (headerChildren[1] && String(headerChildren[1].tagName || "").toLowerCase() !== "div") return null;
+
+    if (actions) {
+      if (String(actions.tagName || "").toLowerCase() !== "div") return null;
+      const actionChildren = Array.from(actions.children || []);
+      if (!actionChildren.length || actionChildren.some((node) => {
+        const tag = String(node.tagName || "").toLowerCase();
+        const role = String(node.getAttribute && node.getAttribute("role") || "").toLowerCase();
+        return tag !== "button" && role !== "button";
+      })) return null;
     }
-    if (!percentages.length) return null;
 
-    const complementaryProgress = progressNodes.some((node) => {
-      const maximum = Number(node.getAttribute && node.getAttribute("max") || node.max);
-      const value = Number(node.getAttribute && node.getAttribute("value") || node.value);
-      return Number.isFinite(maximum) && Math.abs(maximum - 100) <= 0.01
-        && Number.isFinite(value) && value >= 0 && value <= 100
-        && percentages.some((remaining) => Math.abs((100 - remaining) - value) <= 1.5);
-    });
-    if (!complementaryProgress) return null;
-    const semanticScore = nativeQuotaScore(element);
-    return semanticScore === null ? null : 200 + semanticScore;
+    return 320 + (value >= 80 ? 5 : 0);
   }
 
   function findNativeLowUsageAlertCandidate(sidebar, anchor) {
@@ -1280,8 +1320,9 @@
         || candidate.contains(anchor) || isInsideSidebarNavigation(candidate, sidebar)) continue;
       const candidateRect = rectFrom(candidate);
       const alreadyHidden = state.nativeQuotaHidden.has(candidate);
+      const earlySuppressed = earlyNativeSuppressionActive();
       if (!candidateRect) continue;
-      if (!alreadyHidden) {
+      if (!alreadyHidden && !earlySuppressed) {
         if (candidateRect.height <= 0 || candidateRect.height > Math.max(220, sidebarRect.height * 0.32)) continue;
         if (candidateRect.width < sidebarRect.width * 0.55) continue;
         if (candidateRect.left < sidebarRect.left - 2 || candidateRect.right > sidebarRect.right + 2) continue;
@@ -1294,10 +1335,12 @@
     return scored[0].element;
   }
 
-  function findNativeQuotaCandidates(sidebar, anchor) {
+  function findNativeQuotaCandidates(sidebar, anchor, options = {}) {
+    const includeFooter = options.includeFooter !== false;
+    const includeLowUsageAlert = options.includeLowUsageAlert !== false;
     const candidates = [
-      findNativeFooterQuotaCandidate(sidebar, anchor),
-      findNativeLowUsageAlertCandidate(sidebar, anchor),
+      includeFooter ? findNativeFooterQuotaCandidate(sidebar, anchor) : null,
+      includeLowUsageAlert ? findNativeLowUsageAlertCandidate(sidebar, anchor) : null,
     ].filter(Boolean);
     return Array.from(new Set(candidates));
   }
@@ -1325,12 +1368,24 @@
 
   function syncNativeQuotaVisibility() {
     const generalBucket = selectGeneralBucket(state.snapshot ? state.snapshot.buckets : []);
-    const currentFreshness = freshness(state.snapshot, now(), state.explicitlyUnavailable);
-    const shouldHide = Boolean(state.host && state.host.isConnected && state.geometryValidated
-      && generalBucket && currentFreshness !== "unavailable");
-    if (!shouldHide) return restoreNativeQuota();
+    const currentFreshness = freshness(
+      state.snapshot,
+      now(),
+      state.explicitlyUnavailable,
+      state.cachedSnapshot
+    );
+    const panelConnected = Boolean(state.host && state.host.isConnected);
+    const hasUsableGeneralQuota = Boolean(generalBucket && currentFreshness !== "unavailable");
+    const startupPending = state.snapshot === null && !state.explicitlyUnavailable
+      && now() < state.startupSuppressionUntilMs;
+    const shouldHideLowUsageAlert = panelConnected && (startupPending || hasUsableGeneralQuota);
+    const shouldHideFooter = panelConnected && state.geometryValidated && hasUsableGeneralQuota;
+    if (!shouldHideLowUsageAlert && !shouldHideFooter) return restoreNativeQuota();
 
-    const candidates = findNativeQuotaCandidates(state.sidebar, state.anchor);
+    const candidates = findNativeQuotaCandidates(state.sidebar, state.anchor, {
+      includeFooter: shouldHideFooter,
+      includeLowUsageAlert: shouldHideLowUsageAlert,
+    });
     const preserved = new Set(candidates);
     let changed = restoreNativeQuota(preserved);
     for (const candidate of candidates) {
@@ -1581,7 +1636,15 @@
     const target = (sidebar && sidebar.parentElement) || documentRef.documentElement || documentRef.body;
     if (!target || (state.observer && state.observerTarget === target)) return;
     stopMutationObserver();
-    state.observer = new runtime.MutationObserver(scheduleReconcile);
+    state.observer = new runtime.MutationObserver(() => {
+      // MutationObserver callbacks run before the next paint. Suppress a newly
+      // inserted native alert synchronously, then debounce the heavier layout
+      // and anchor validation work as before.
+      if (state.host && state.host.isConnected && state.sidebar && state.anchor) {
+        syncNativeQuotaVisibility();
+      }
+      scheduleReconcile();
+    });
     state.observer.observe(target, { childList: true, subtree: true });
     state.observerTarget = target;
     if (!state.host || !state.host.isConnected) scheduleMountRetry();
@@ -1631,6 +1694,7 @@
     if (!shell.ok || !shell.sidebar.isConnected) {
       stopObservers();
       detachPanel(shell.ok ? "sidebar-not-connected" : shell.reason);
+      if (shell.reason === "protocol-not-allowed") cleanupEarlyNativeSuppression(shell.reason);
       if (runtime.location && runtime.location.protocol === "app:") {
         scheduleDomReadyMount();
         observeForRebuild(null);
@@ -1650,6 +1714,7 @@
       } else if (syncNativeQuotaVisibility()) {
         scheduleReconcile();
       }
+      cleanupEarlyNativeSuppression("existing-panel-ready");
       return publicStatus();
     }
 
@@ -1700,11 +1765,13 @@
     state.anchorScore = score;
     state.mountedAtMs = now();
     state.reason = null;
+    syncNativeQuotaVisibility();
     render();
 
     const scrollDockElement = applyScrollDock(scrollRegions);
     if (!scrollDockElement) {
       detachPanel("conversation-scroll-dock-not-found");
+      cleanupEarlyNativeSuppression("conversation-scroll-dock-not-found");
       observeForRebuild(sidebar);
       return publicStatus();
     }
@@ -1720,6 +1787,7 @@
     );
     if (!validation.ok) {
       detachPanel(validation.reason);
+      cleanupEarlyNativeSuppression(validation.reason);
       observeForRebuild(sidebar);
       return publicStatus();
     }
@@ -1728,6 +1796,7 @@
     clearMountRetry();
     observeForRebuild(sidebar);
     observeForResize(sidebar, anchor, host, panel);
+    cleanupEarlyNativeSuppression("panel-ready");
 
     if (typeof runtime.requestAnimationFrame === "function") {
       runtime.requestAnimationFrame(() => runtime.requestAnimationFrame(() => {
@@ -1766,6 +1835,7 @@
     if (!shell.ok) {
       stopObservers();
       detachPanel(shell.reason);
+      if (shell.reason === "protocol-not-allowed") cleanupEarlyNativeSuppression(shell.reason);
       if (runtime.location && runtime.location.protocol === "app:") {
         scheduleDomReadyMount();
         observeForRebuild(null);
@@ -1792,10 +1862,14 @@
 
   function update(value) {
     state.lastHeartbeatMs = now();
+    if (value == null || (value && typeof value === "object" && value.availability === "unavailable")) {
+      cleanupEarlyNativeSuppression("quota-update-unavailable");
+    }
     const shell = shellCheck();
     if (!shell.ok) {
       stopObservers();
       detachPanel(shell.reason);
+      if (shell.reason === "protocol-not-allowed") cleanupEarlyNativeSuppression(shell.reason);
       if (runtime.location && runtime.location.protocol === "app:") {
         scheduleDomReadyMount();
         observeForRebuild(null);
@@ -1826,21 +1900,15 @@
         ? reasonCode || "E_RATE_LIMIT_UNAVAILABLE"
         : null;
     }
+    if (state.explicitlyUnavailable
+      || !selectGeneralBucket(state.snapshot ? state.snapshot.buckets : [])) {
+      cleanupEarlyNativeSuppression("general-quota-unavailable");
+    }
     return reconcile();
   }
 
   function unavailable(details) {
     state.lastHeartbeatMs = now();
-    const shell = shellCheck();
-    if (!shell.ok) {
-      stopObservers();
-      detachPanel(shell.reason);
-      if (runtime.location && runtime.location.protocol === "app:") {
-        scheduleDomReadyMount();
-        observeForRebuild(null);
-      }
-      return publicStatus();
-    }
     const reasonCode = typeof details === "string"
       ? safeReasonCode(details)
       : safeReasonCode(details && details.reasonCode);
@@ -1848,6 +1916,18 @@
     state.explicitlyUnavailable = true;
     state.cachedSnapshot = false;
     state.unavailableReasonCode = reasonCode;
+    cleanupEarlyNativeSuppression("quota-unavailable");
+    const shell = shellCheck();
+    if (!shell.ok) {
+      stopObservers();
+      detachPanel(shell.reason);
+      if (shell.reason === "protocol-not-allowed") cleanupEarlyNativeSuppression(shell.reason);
+      if (runtime.location && runtime.location.protocol === "app:") {
+        scheduleDomReadyMount();
+        observeForRebuild(null);
+      }
+      return publicStatus();
+    }
     return reconcile();
   }
 
@@ -1866,17 +1946,27 @@
     if (state.countdownTimer !== null) runtime.clearInterval(state.countdownTimer);
     if (state.heartbeatTimer !== null) runtime.clearInterval(state.heartbeatTimer);
     if (state.localeTimer !== null) runtime.clearInterval(state.localeTimer);
+    if (state.startupSuppressionTimer !== null) runtime.clearTimeout(state.startupSuppressionTimer);
     if (state.languageChangeHandler && typeof runtime.removeEventListener === "function") {
       runtime.removeEventListener("languagechange", state.languageChangeHandler);
     }
     state.countdownTimer = null;
     state.heartbeatTimer = null;
     state.localeTimer = null;
+    state.startupSuppressionTimer = null;
     state.languageChangeHandler = null;
+    cleanupEarlyNativeSuppression(reason);
     return publicStatus();
   }
 
   function ensureTimers() {
+    if (state.startupSuppressionTimer === null && now() < state.startupSuppressionUntilMs) {
+      state.startupSuppressionTimer = runtime.setTimeout(() => {
+        state.startupSuppressionTimer = null;
+        cleanupEarlyNativeSuppression("startup-suppression-timeout");
+        if (!state.cleaned) reconcile();
+      }, Math.max(0, state.startupSuppressionUntilMs - now()));
+    }
     if (state.countdownTimer === null) {
       state.countdownTimer = runtime.setInterval(() => {
         if (state.host && state.host.isConnected) reconcile();

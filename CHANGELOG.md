@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-07-22
+
+### Fixed
+
+- Native low-usage alerts are now identified by their status, header, dismiss
+  control, and progress structure instead of translated text, covering every
+  Codex interface language without broad sidebar matching.
+- A self-expiring early style suppresses the native alert during cold-start
+  handoff, and the full panel keeps it hidden while the first quota snapshot is
+  loading instead of waiting for usable data before taking over.
+- Late React insertions are suppressed in the MutationObserver callback before
+  the next paint; startup failures, unavailable quota, cleanup, and a bounded
+  loading deadline restore the native fallback.
+
 ## [0.4.3] - 2026-07-22
 
 ### Fixed

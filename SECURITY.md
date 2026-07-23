@@ -45,8 +45,13 @@ binding prevents direct remote access, but does not make the endpoint private
 from the local user session.
 
 The launcher validates the Microsoft Store package, verifies listener ownership,
-pins the original Browser identity, accepts only guarded `app://` renderer
-targets, and fails closed when the sidebar anchor or layout is ambiguous. These
+and pins the original Browser identity. The full component and all quota data
+are sent only to a guarded renderer that passes the strict Codex main-shell
+probe; the component also fails closed when the sidebar anchor or layout is
+ambiguous. During cold start, the launcher applies a separate static style to
+discovered `app://` pages from that same pinned Browser identity. That style is
+scoped to the exact native low-usage card structure, reads no DOM text or data,
+and removes itself after 30 seconds unless the full component takes over. These
 controls prevent confused attachment by this project; they cannot impose
 authentication on CDP itself.
 

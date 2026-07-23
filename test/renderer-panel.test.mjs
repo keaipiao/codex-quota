@@ -4,6 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 
 const injectorSource = await readFile(new URL("../src/renderer/panel-inject.js", import.meta.url), "utf8");
+const earlySuppressorSource = await readFile(new URL("../src/renderer/early-suppress.js", import.meta.url), "utf8");
 
 class FakeStyle {
   constructor() {
@@ -208,23 +209,57 @@ function rect(top, bottom, width = 260, left = 0) {
   return { top, bottom, left, right: left + width, width, height: bottom - top };
 }
 
-function createNativeLowUsageAlert({ remainingPercent = 10, top = 540, bottom = 650 } = {}) {
+function createNativeLowUsageAlert({
+  remainingPercent = 10,
+  top = 540,
+  bottom = 650,
+  titleText = `${remainingPercent}% usage remaining`,
+  dismissLabel = "Dismiss usage alert",
+  progressLabel = "Usage consumed",
+  resetText = "Resets later",
+  actionLabels = [],
+} = {}) {
   const wrapper = new FakeElement("div", rect(top, bottom));
   wrapper.className = "w-full mb-2";
   const status = new FakeElement("div", rect(top, bottom));
+  status.className = "flex w-full flex-col rounded-2xl border";
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
-  status.textContent = `${remainingPercent}% usage remaining`;
+  const header = new FakeElement("div", rect(top + 8, top + 54, 236, 12));
+  const titleRow = new FakeElement("div", rect(top + 8, top + 30, 236, 12));
+  const title = new FakeElement("span", rect(top + 8, top + 28, 196, 12));
+  title.textContent = titleText;
   const dismiss = new FakeElement("button", rect(top + 8, top + 28, 20, 228));
-  dismiss.setAttribute("aria-label", "Dismiss usage alert");
+  dismiss.className = "no-drag";
+  dismiss.setAttribute("type", "button");
+  dismiss.setAttribute("aria-label", dismissLabel);
+  titleRow.appendChild(title);
+  titleRow.appendChild(dismiss);
+  header.appendChild(titleRow);
+  if (resetText !== null) {
+    const reset = new FakeElement("div", rect(top + 32, top + 50, 236, 12));
+    reset.textContent = resetText;
+    header.appendChild(reset);
+  }
   const progress = new FakeElement("progress", rect(bottom - 20, bottom - 14, 236, 12));
-  progress.setAttribute("aria-label", "Usage consumed");
+  progress.setAttribute("aria-label", progressLabel);
   progress.setAttribute("max", "100");
   progress.setAttribute("value", String(100 - remainingPercent));
-  status.appendChild(dismiss);
+  status.appendChild(header);
   status.appendChild(progress);
+  let actions = null;
+  if (actionLabels.length) {
+    actions = new FakeElement("div", rect(bottom - 42, bottom - 22, 236, 12));
+    for (const label of actionLabels) {
+      const action = new FakeElement("button", rect(bottom - 42, bottom - 22, 100, 12));
+      action.setAttribute("type", "button");
+      action.textContent = label;
+      actions.appendChild(action);
+    }
+    status.appendChild(actions);
+  }
   wrapper.appendChild(status);
-  return { wrapper, status, dismiss, progress };
+  return { wrapper, status, header, titleRow, title, dismiss, progress, actions };
 }
 
 function createEnvironment(options = {}) {
@@ -452,6 +487,215 @@ function snapshot(fetchedAtMs) {
     ],
   };
 }
+
+test("early native suppression installs a language-independent structural style and self-cleans", () => {
+  const root = {
+    children: [],
+    appendChild(element) {
+      this.children.push(element);
+      element.parentNode = this;
+      return element;
+    },
+    removeChild(element) {
+      this.children.splice(this.children.indexOf(element), 1);
+      element.parentNode = null;
+    },
+  };
+  const timers = [];
+  const document = {
+    head: root,
+    documentElement: root,
+    createElement: () => ({ id: "", textContent: "", parentNode: null }),
+    getElementById: (id) => root.children.find((element) => element.id === id) || null,
+  };
+  const window = {
+    document,
+    location: { protocol: "app:" },
+    setTimeout(callback, milliseconds) {
+      const handle = { callback, milliseconds, active: true };
+      timers.push(handle);
+      return handle;
+    },
+    clearTimeout(handle) { if (handle) handle.active = false; },
+  };
+  const result = new vm.Script(earlySuppressorSource).runInContext(vm.createContext({ window }));
+  const style = root.children[0];
+
+  assert.equal(result.active, true);
+  assert.equal(result.reason, null);
+  assert.equal(style.id, "codex-quota-early-native-suppressor");
+  assert.match(style.textContent, /role="status"/);
+  assert.match(style.textContent, /> progress\[max="100"\]\[value\]/);
+  assert.match(style.textContent, /button\[type="button"\]\.no-drag/);
+  assert.match(style.textContent, /:not\(nav \*\)/);
+  assert.match(style.textContent, /:not\(\[data-app-action-sidebar-scroll\] \*\)/);
+  assert.doesNotMatch(style.textContent, /usage|quota|remaining|棰濆害|%/i);
+  assert.ok(timers[0].milliseconds > 29_000 && timers[0].milliseconds <= 30_000);
+
+  timers[0].callback();
+  assert.equal(root.children.length, 0);
+  assert.equal(window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__, undefined);
+});
+
+test("an early style installed near registration expiry uses only the absolute time remaining", () => {
+  let clock = 29_900;
+  class ClockDate extends Date {
+    static now() { return clock; }
+  }
+  const root = {
+    children: [],
+    appendChild(element) { this.children.push(element); element.parentNode = this; },
+    removeChild(element) { this.children.splice(this.children.indexOf(element), 1); element.parentNode = null; },
+  };
+  const timers = [];
+  const document = {
+    head: root,
+    documentElement: root,
+    createElement: () => ({ id: "", textContent: "", parentNode: null }),
+    getElementById: (id) => root.children.find((element) => element.id === id) || null,
+  };
+  const window = {
+    document,
+    location: { protocol: "app:" },
+    setTimeout(callback, milliseconds) {
+      const handle = { callback, milliseconds };
+      timers.push(handle);
+      return handle;
+    },
+    clearTimeout() {},
+  };
+  const wrappedSource = `((__codexQuotaEarlyDeadlineMs) => { return ${earlySuppressorSource}\n})(30000)`;
+  const result = new vm.Script(wrappedSource).runInContext(vm.createContext({ window, Date: ClockDate }));
+
+  assert.equal(result.active, true);
+  assert.equal(timers[0].milliseconds, 100);
+  clock = 30_000;
+  timers[0].callback();
+  assert.equal(root.children.length, 0);
+});
+
+test("early suppression installs as soon as a document root appears before DOMContentLoaded", () => {
+  const root = {
+    children: [],
+    appendChild(element) {
+      this.children.push(element);
+      element.parentNode = this;
+      return element;
+    },
+    removeChild(element) {
+      this.children.splice(this.children.indexOf(element), 1);
+      element.parentNode = null;
+    },
+  };
+  let readyHandler = null;
+  const observers = [];
+  class FakeMutationObserver {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      observers.push(this);
+    }
+    observe(target, options) {
+      this.target = target;
+      this.options = options;
+    }
+    disconnect() { this.disconnected = true; }
+  }
+  const document = {
+    head: null,
+    documentElement: null,
+    createElement: () => ({ id: "", textContent: "", parentNode: null }),
+    getElementById: (id) => root.children.find((element) => element.id === id) || null,
+    addEventListener(name, callback) { if (name === "DOMContentLoaded") readyHandler = callback; },
+    removeEventListener(name, callback) {
+      if (name === "DOMContentLoaded" && readyHandler === callback) readyHandler = null;
+    },
+  };
+  const window = {
+    document,
+    location: { protocol: "app:" },
+    MutationObserver: FakeMutationObserver,
+    setTimeout: () => ({ active: true }),
+    clearTimeout() {},
+  };
+  const initial = new vm.Script(earlySuppressorSource).runInContext(vm.createContext({ window }));
+  assert.equal(initial.active, false);
+  assert.equal(initial.pending, true);
+  assert.equal(typeof readyHandler, "function");
+  assert.equal(observers.length, 1);
+  assert.equal(observers[0].target, document);
+
+  document.documentElement = root;
+  observers[0].callback([{ type: "childList" }]);
+  assert.equal(window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__.status().active, true);
+  assert.equal(root.children[0].id, "codex-quota-early-native-suppressor");
+  assert.equal(observers[0].disconnected, true);
+  assert.equal(readyHandler, null);
+  window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__.cleanup("test");
+  assert.equal(root.children.length, 0);
+});
+
+test("a late early-suppression evaluation cannot override terminal full-panel states", () => {
+  const cases = [
+    [{ mounted: true, cleaned: false, freshness: "loading", reason: null }, "panel-already-mounted"],
+    [{ mounted: false, cleaned: true, freshness: "loading", reason: "manual-cleanup" }, "panel-cleaned"],
+    [{ mounted: false, cleaned: false, freshness: "unavailable", reason: "anchor-not-found" }, "panel-unavailable"],
+    [{ mounted: false, cleaned: false, freshness: "loading", reason: "conversation-scroll-dock-not-found" }, "panel-mount-failed"],
+  ];
+
+  for (const [status, expectedReason] of cases) {
+    const root = {
+      children: [],
+      appendChild(element) { this.children.push(element); element.parentNode = this; },
+    };
+    const document = {
+      head: root,
+      documentElement: root,
+      createElement: () => ({ id: "", textContent: "", parentNode: null }),
+      getElementById: () => null,
+    };
+    const window = {
+      document,
+      location: { protocol: "app:" },
+      __CODEX_QUOTA_PANEL__: { status: () => status },
+    };
+
+    const result = new vm.Script(earlySuppressorSource).runInContext(vm.createContext({ window }));
+    assert.equal(result.active, false);
+    assert.equal(result.reason, expectedReason);
+    assert.equal(root.children.length, 0);
+    assert.equal(window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__, undefined);
+  }
+});
+
+test("a late early-suppression evaluation still covers a transient anchor startup state", () => {
+  const root = {
+    children: [],
+    appendChild(element) { this.children.push(element); element.parentNode = this; },
+    removeChild(element) { this.children.splice(this.children.indexOf(element), 1); element.parentNode = null; },
+  };
+  const document = {
+    head: root,
+    documentElement: root,
+    createElement: () => ({ id: "", textContent: "", parentNode: null }),
+    getElementById: (id) => root.children.find((element) => element.id === id) || null,
+  };
+  const window = {
+    document,
+    location: { protocol: "app:" },
+    __CODEX_QUOTA_PANEL__: {
+      status: () => ({ mounted: false, cleaned: false, freshness: "loading", reason: "anchor-not-found" }),
+    },
+    setTimeout: () => ({ active: true }),
+    clearTimeout() {},
+  };
+
+  const result = new vm.Script(earlySuppressorSource).runInContext(vm.createContext({ window }));
+  assert.equal(result.active, true);
+  assert.equal(root.children.length, 1);
+  window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__.cleanup("test");
+  assert.equal(root.children.length, 0);
+});
 
 test("injector evaluates to a structured result and mounts in normal flow before the account footer", () => {
   const environment = createEnvironment();
@@ -788,7 +1032,7 @@ test("a unique native footer quota is hidden only while the injected general quo
   assert.equal(fresh.nativeQuotaHiddenCount, 1);
   assert.equal(nativeQuota.style.display, "none");
   assert.equal(nativeQuota.style.getPropertyPriority("display"), "important");
-  assert.equal(nativeQuota.getAttribute("data-codex-quota-native-hidden"), "0.4.3");
+  assert.equal(nativeQuota.getAttribute("data-codex-quota-native-hidden"), "0.4.4");
   assert.notEqual(unrelated.style.display, "none");
   assert.notEqual(environment.accountButton.style.display, "none");
 
@@ -798,7 +1042,7 @@ test("a unique native footer quota is hidden only while the injected general quo
   assert.equal(repaired.nativeQuotaHiddenCount, 1);
   assert.equal(nativeQuota.style.display, "none");
   assert.equal(nativeQuota.style.getPropertyPriority("display"), "important");
-  assert.equal(nativeQuota.getAttribute("data-codex-quota-native-hidden"), "0.4.3");
+  assert.equal(nativeQuota.getAttribute("data-codex-quota-native-hidden"), "0.4.4");
 
   const unavailable = api.unavailable({ reason: "temporarily unavailable" });
   assert.equal(unavailable.nativeQuotaHiddenCount, 0);
@@ -815,7 +1059,121 @@ test("a unique native footer quota is hidden only while the injected general quo
   assert.equal(environment.scroller.style.getPropertyValue("--sidebar-scroll-footer-edge"), "");
 });
 
-test("a late low-usage sidebar card outside the account footer is hidden without leaving its wrapper", () => {
+test("native low-usage cards are matched structurally in every language and hidden while startup is loading", () => {
+  const localizedCards = [
+    { language: "mn-MN", titleText: "Таны ашиглах боломж багаслаа", dismissLabel: "Хаах", progressLabel: "Ашигласан хэмжээ" },
+    { language: "fil-PH", titleText: "Kaunti na lang ang magagamit", dismissLabel: "Isara", progressLabel: "Nagamit na" },
+    { language: "ar", titleText: "اقترب حد الاستخدام", dismissLabel: "إغلاق", progressLabel: "المستخدم" },
+    { language: "zz-ZZ", titleText: "ᚠᛇᚻ 無意味 🜁", dismissLabel: "◇", progressLabel: "◌" },
+  ];
+
+  for (const localized of localizedCards) {
+    const environment = createEnvironment({ language: localized.language });
+    const { wrapper } = createNativeLowUsageAlert({
+      remainingPercent: 10,
+      titleText: localized.titleText,
+      dismissLabel: localized.dismissLabel,
+      progressLabel: localized.progressLabel,
+      actionLabels: ["↗"],
+    });
+    wrapper.style.display = "flex";
+    environment.layout.insertBefore(wrapper, environment.footer);
+
+    const initial = environment.evaluate();
+    assert.equal(initial.freshness, "loading");
+    assert.equal(initial.nativeQuotaHiddenCount, 1, localized.language);
+    assert.equal(wrapper.style.display, "none", localized.language);
+    assert.equal(wrapper.style.getPropertyPriority("display"), "important", localized.language);
+
+    environment.window.__CODEX_QUOTA_PANEL__.unavailable({ reasonCode: "E_RATE_LIMIT_UNAVAILABLE" });
+    assert.equal(wrapper.style.display, "flex", localized.language);
+  }
+});
+
+test("the full panel takes over a card already collapsed by the early suppressor", () => {
+  const environment = createEnvironment();
+  const { wrapper } = createNativeLowUsageAlert({
+    top: 0,
+    bottom: 0,
+    titleText: "Ачаалж байна",
+    dismissLabel: "Хаах",
+    progressLabel: "Ашигласан",
+  });
+  wrapper.style.display = "flex";
+  environment.layout.insertBefore(wrapper, environment.footer);
+  let earlyActive = true;
+  let cleanupCalls = 0;
+  environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__ = {
+    status: () => ({ active: earlyActive }),
+    cleanup() {
+      cleanupCalls += 1;
+      earlyActive = false;
+      delete environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__;
+    },
+  };
+
+  const initial = environment.evaluate();
+  assert.equal(initial.nativeQuotaHiddenCount, 1);
+  assert.equal(wrapper.style.display, "none");
+  assert.equal(wrapper.style.getPropertyPriority("display"), "important");
+  assert.equal(cleanupCalls, 1);
+});
+
+test("startup suppression expires safely if quota loading never resolves", () => {
+  const environment = createEnvironment();
+  const { wrapper } = createNativeLowUsageAlert({ titleText: "Текстгүй шалгалт" });
+  wrapper.style.display = "flex";
+  environment.layout.insertBefore(wrapper, environment.footer);
+
+  environment.evaluate();
+  assert.equal(wrapper.style.display, "none");
+  environment.advance(15_001);
+  const deadline = environment.timeouts.find((entry) => entry.active && entry.milliseconds === 15_000);
+  assert.ok(deadline);
+  deadline.callback();
+
+  assert.equal(environment.window.__CODEX_QUOTA_PANEL__.status().nativeQuotaHiddenCount, 0);
+  assert.equal(wrapper.style.display, "flex");
+});
+
+test("low-usage structural matching rejects malformed and generic progress cards", () => {
+  const cases = [
+    ({ progress }) => progress.setAttribute("max", "1"),
+    ({ status, progress, header }) => {
+      status.removeChild(progress);
+      header.appendChild(progress);
+    },
+    ({ dismiss }) => dismiss.removeAttribute("type"),
+    ({ status }) => status.setAttribute("aria-live", "assertive"),
+    ({ status }) => { status.className = "generic-status-card"; },
+    ({ dismiss }) => { dismiss.className = "generic-dismiss"; },
+  ];
+
+  for (const mutate of cases) {
+    const environment = createEnvironment();
+    const alert = createNativeLowUsageAlert({ titleText: "Хэл үл хамаарна" });
+    mutate(alert);
+    environment.layout.insertBefore(alert.wrapper, environment.footer);
+    const result = environment.evaluate();
+    assert.equal(result.nativeQuotaHiddenCount, 0);
+    assert.notEqual(alert.wrapper.style.display, "none");
+  }
+});
+
+test("two structural low-usage candidates fail closed instead of hiding either", () => {
+  const environment = createEnvironment();
+  const first = createNativeLowUsageAlert({ top: 520, bottom: 610, titleText: "Нэг" });
+  const second = createNativeLowUsageAlert({ top: 620, bottom: 710, titleText: "Хоёр" });
+  environment.layout.insertBefore(first.wrapper, environment.footer);
+  environment.layout.insertBefore(second.wrapper, environment.footer);
+
+  const result = environment.evaluate();
+  assert.equal(result.nativeQuotaHiddenCount, 0);
+  assert.notEqual(first.wrapper.style.display, "none");
+  assert.notEqual(second.wrapper.style.display, "none");
+});
+
+test("a late low-usage sidebar card is hidden in the observer callback before deferred reconciliation", () => {
   const environment = createEnvironment();
   environment.evaluate();
   const api = environment.window.__CODEX_QUOTA_PANEL__;
@@ -826,6 +1184,10 @@ test("a late low-usage sidebar card outside the account footer is hidden without
 
   const observer = environment.observers.find((entry) => !entry.disconnected);
   observer.callback([{ type: "childList", addedNodes: [wrapper] }]);
+  assert.equal(wrapper.style.display, "none");
+  assert.equal(wrapper.style.getPropertyPriority("display"), "important");
+  assert.equal(wrapper.getAttribute("data-codex-quota-native-hidden"), "0.4.4");
+
   const reconcile = environment.timeouts.find((entry) => entry.active && entry.milliseconds === 80);
   assert.ok(reconcile);
   reconcile.callback();
@@ -833,7 +1195,7 @@ test("a late low-usage sidebar card outside the account footer is hidden without
   assert.equal(hidden.nativeQuotaHiddenCount, 1);
   assert.equal(wrapper.style.display, "none");
   assert.equal(wrapper.style.getPropertyPriority("display"), "important");
-  assert.equal(wrapper.getAttribute("data-codex-quota-native-hidden"), "0.4.3");
+  assert.equal(wrapper.getAttribute("data-codex-quota-native-hidden"), "0.4.4");
 
   // Browsers collapse a display:none element's geometry. A later reconcile
   // must keep ownership instead of restoring and hiding it in a loop.
@@ -1051,7 +1413,7 @@ test("the DOM observer watches only child-list changes and debounces reconciliat
   assert.deepEqual(Object.keys(observer.config).sort(), ["childList", "subtree"]);
   observer.callback([{ type: "childList" }]);
   observer.callback([{ type: "childList" }]);
-  const activeTimeouts = environment.timeouts.filter((entry) => entry.active);
+  const activeTimeouts = environment.timeouts.filter((entry) => entry.active && entry.milliseconds === 80);
   assert.equal(activeTimeouts.length, 1);
   assert.equal(activeTimeouts[0].milliseconds, 80);
 });
@@ -1167,6 +1529,96 @@ test("a late account anchor mounts through the bounded fast retry without waitin
   assert.equal(recovered.mounted, true);
   assert.equal(recovered.geometryValidated, true);
   assert.equal(environment.layout.children.filter((element) => element.id === "codex-quota-panel").length, 1);
+});
+
+test("early suppression stays active until a late account anchor lets the full panel take over", () => {
+  const environment = createEnvironment({ menuTrigger: false });
+  const alert = createNativeLowUsageAlert({ top: 0, bottom: 0, titleText: "startup alert" });
+  alert.wrapper.style.display = "none";
+  environment.layout.insertBefore(alert.wrapper, environment.footer);
+  let earlyActive = true;
+  let cleanupCalls = 0;
+  environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__ = {
+    status: () => ({ active: earlyActive }),
+    cleanup() {
+      cleanupCalls += 1;
+      earlyActive = false;
+      delete environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__;
+    },
+  };
+
+  const initial = environment.evaluate();
+  assert.equal(initial.mounted, false);
+  assert.equal(initial.reason, "anchor-not-found");
+  assert.equal(cleanupCalls, 0);
+  assert.equal(alert.wrapper.style.display, "none");
+
+  const retry = environment.timeouts.find((entry) => entry.active && entry.milliseconds === 100);
+  assert.ok(retry);
+  environment.accountButton.setAttribute("aria-haspopup", "menu");
+  environment.accountButton.setAttribute("aria-expanded", "false");
+  environment.accountButton.setAttribute("data-state", "closed");
+  retry.active = false;
+  retry.callback();
+
+  const recovered = environment.window.__CODEX_QUOTA_PANEL__.status();
+  assert.equal(recovered.mounted, true);
+  assert.equal(recovered.nativeQuotaHiddenCount, 1);
+  assert.equal(cleanupCalls, 1);
+  assert.equal(alert.wrapper.style.display, "none");
+  assert.equal(alert.wrapper.style.getPropertyPriority("display"), "important");
+});
+
+test("unavailable quota releases an existing early guard even while the account anchor is missing", () => {
+  const publications = [
+    (api) => api.unavailable({ reasonCode: "E_RATE_LIMIT_UNAVAILABLE" }),
+    (api) => api.update({
+      availability: "unavailable",
+      reasonCode: "E_RATE_LIMIT_UNAVAILABLE",
+      snapshot: snapshot(1_800_000_000_000),
+    }),
+    (api) => api.update(null),
+  ];
+
+  for (const publish of publications) {
+    const environment = createEnvironment({ menuTrigger: false });
+    let cleanupCalls = 0;
+    environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__ = {
+      status: () => ({ active: true }),
+      cleanup() {
+        cleanupCalls += 1;
+        delete environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__;
+      },
+    };
+    const initial = environment.evaluate();
+    assert.equal(initial.reason, "anchor-not-found");
+    assert.equal(cleanupCalls, 0);
+
+    publish(environment.window.__CODEX_QUOTA_PANEL__);
+    assert.equal(cleanupCalls, 1);
+    assert.equal(environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__, undefined);
+  }
+});
+
+test("the startup deadline releases an existing early guard when the account anchor never appears", () => {
+  const environment = createEnvironment({ menuTrigger: false });
+  let cleanupCalls = 0;
+  environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__ = {
+    status: () => ({ active: true }),
+    cleanup() {
+      cleanupCalls += 1;
+      delete environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__;
+    },
+  };
+  environment.evaluate();
+  const deadline = environment.timeouts.find((entry) => entry.active && entry.milliseconds === 15_000);
+  assert.ok(deadline);
+
+  environment.advance(15_001);
+  deadline.active = false;
+  deadline.callback();
+  assert.equal(cleanupCalls, 1);
+  assert.equal(environment.window.__CODEX_QUOTA_EARLY_NATIVE_SUPPRESSOR__, undefined);
 });
 
 test("the general bucket uses a readable stacked layout for two limit periods", () => {

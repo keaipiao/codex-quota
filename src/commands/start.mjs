@@ -16,6 +16,7 @@ import { redactLogText } from "../host/logger.mjs";
 import { PACKAGE_ROOT, getPaths } from "../paths.mjs";
 import { createSessionRecord, updateSession } from "../session-state.mjs";
 import { chooseLoopbackPort } from "../cdp/loopback.mjs";
+import { installEarlyQuotaSuppression } from "../cdp/early-suppressor.mjs";
 import { launchCodexWithCdp } from "../cdp/windows-launcher.mjs";
 import { getInstalledRuntime } from "./install.mjs";
 
@@ -221,6 +222,7 @@ export async function startCommand(options = {}, dependencies = {}) {
     updateSession,
     launchCodexWithCdp,
     chooseLoopbackPort,
+    installEarlyQuotaSuppression,
     createNonce: randomUUID,
     buildDaemonSpec,
     spawnDaemon,
@@ -362,6 +364,22 @@ export async function startCommand(options = {}, dependencies = {}) {
     // after Codex starts, the next invocation can recover the exact listener.
     await services.writeJsonAtomic(paths.session, pending);
     const launch = await services.launchCodexWithCdp({ port: launchPort });
+
+    // Start the short-lived visual guard at the earliest safely verified
+    // point. It is intentionally fire-and-forget: the helper has its own
+    // bounded deadline, and daemon identity transfer must never wait for a
+    // cosmetic startup optimization.
+    try {
+      void Promise.resolve(services.installEarlyQuotaSuppression({
+        engineRoot: runtime.engineRoot,
+        port: launch.port,
+        browserId: launch.browserId,
+        browserWebSocketUrl: launch.browserWebSocketUrl,
+      })).catch(() => null);
+    } catch {
+      // Renderer startup suppression is best-effort.
+    }
+
     const session = services.createSessionRecord(mapLaunchToSessionInput(launch), {
       nonce: pending.nonce,
       createdAtMs: pending.createdAtMs,
